@@ -445,24 +445,18 @@ int nvme_mdev_mmio_create(struct nvme_mdev_vctrl *vctrl)
 	if (!vctrl->mmio.dbs_page)
 		goto error0;
 
-	vctrl->mmio.db_page_kmap = kmap(vctrl->mmio.dbs_page);
-	if (!vctrl->mmio.db_page_kmap)
-		goto error1;
+	/*
+	 * Used from several threads for the lifetime of the device, so not
+	 * kmap_local; the driver is 64-bit only, there is no highmem.
+	 */
+	vctrl->mmio.db_page_kmap = page_address(vctrl->mmio.dbs_page);
 
 	vctrl->mmio.fake_eidx_page = alloc_pages_node(vctrl->hctrl->node,
 						      __GFP_ZERO, 0);
 	if (!vctrl->mmio.fake_eidx_page)
-		goto error2;
-
-	vctrl->mmio.fake_eidx_kmap = kmap(vctrl->mmio.fake_eidx_page);
-	if (!vctrl->mmio.fake_eidx_kmap)
-		goto error3;
+		goto error1;
+	vctrl->mmio.fake_eidx_kmap = page_address(vctrl->mmio.fake_eidx_page);
 	return 0;
-error3:
-	/* (the 2019 version passed the kmap address instead of the page) */
-	put_page(vctrl->mmio.fake_eidx_page);
-error2:
-	kunmap(vctrl->mmio.dbs_page);
 error1:
 	put_page(vctrl->mmio.dbs_page);
 error0:
@@ -580,8 +574,6 @@ void nvme_mdev_mmio_disable_dbs(struct nvme_mdev_vctrl *vctrl)
 void nvme_mdev_mmio_free(struct nvme_mdev_vctrl *vctrl)
 {
 	nvme_mdev_assert_io_not_running(vctrl);
-	kunmap(vctrl->mmio.dbs_page);
 	put_page(vctrl->mmio.dbs_page);
-	kunmap(vctrl->mmio.fake_eidx_page);
 	put_page(vctrl->mmio.fake_eidx_page);
 }

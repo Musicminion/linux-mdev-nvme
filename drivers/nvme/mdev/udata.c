@@ -229,10 +229,7 @@ int nvme_mdev_read_from_udata(void *dst, struct nvme_ext_data_iter *srcit,
 
 	while (srcit->count && size > 0) {
 		struct page *page = pfn_to_page(PHYS_PFN(srcit->physical));
-		void *src = kmap(page);
-
-		if (!src)
-			return -ENOMEM;
+		void *src = kmap_local_page(page);
 
 		srcoffset = OFFSET_IN_PAGE(srcit->physical);
 		chunk_size = min(size, (u64)PAGE_SIZE - srcoffset);
@@ -240,7 +237,7 @@ int nvme_mdev_read_from_udata(void *dst, struct nvme_ext_data_iter *srcit,
 		memcpy(dst, src + srcoffset, chunk_size);
 		dst += chunk_size;
 		size -= chunk_size;
-		kunmap(page);
+		kunmap_local(src);
 
 		ret = srcit->next(srcit);
 		if (ret)
@@ -258,10 +255,7 @@ int nvme_mdev_write_to_udata(struct nvme_ext_data_iter *dstit, void *src,
 
 	while (dstit->count && size > 0) {
 		struct page *page = pfn_to_page(PHYS_PFN(dstit->physical));
-		void *dst = kmap(page);
-
-		if (!dst)
-			return -ENOMEM;
+		void *dst = kmap_local_page(page);
 
 		dstoffset = OFFSET_IN_PAGE(dstit->physical);
 		chunk_size = min(size, (u64)PAGE_SIZE - dstoffset);
@@ -269,7 +263,7 @@ int nvme_mdev_write_to_udata(struct nvme_ext_data_iter *dstit, void *src,
 		memcpy(dst + dstoffset, src, chunk_size);
 		src += chunk_size;
 		size -= chunk_size;
-		kunmap(page);
+		kunmap_local(dst);
 
 		ret = dstit->next(dstit);
 		if (ret)

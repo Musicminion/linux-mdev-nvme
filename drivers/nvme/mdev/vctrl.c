@@ -236,7 +236,6 @@ int nvme_mdev_vctrl_open(struct nvme_mdev_vctrl *vctrl)
 	nvme_mdev_mmio_open(vctrl);
 	vctrl->inuse = true;
 
-
 out:
 	mutex_unlock(&vctrl->lock);
 	return ret;

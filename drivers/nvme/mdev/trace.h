@@ -28,7 +28,7 @@ TRACE_EVENT(nvme_mdev_io_submit,
 	TP_fast_assign(
 		__assign_str(dev);
 		__entry->sqid = sqid;
-		__entry->cid = le16_to_cpu((__force __le16)cmd->common.command_id);
+		__entry->cid = nvme_mdev_cmd_cid(cmd);
 		__entry->nsid = le32_to_cpu(cmd->common.nsid);
 		__entry->opcode = cmd->common.opcode;
 		__entry->slba = le64_to_cpu(cmd->rw.slba);

@@ -170,6 +170,7 @@ static void nvme_mdev_hctrl_chain_done(struct bio *bio)
 	u16 status = nvme_mdev_translate_error_block(bio->bi_status);
 
 	bio_put(bio);
+	/* publishes the completion, pairs with the acquire in hq_poll() */
 	smp_store_release(&mbio->status, status);
 }
 
@@ -302,13 +303,15 @@ int nvme_mdev_hctrl_hq_submit(struct nvme_mdev_hctrl *hctrl,
 			datait->release(datait);
 		} else {
 			u16 control = le16_to_cpu(cmd->write_zeroes.control);
+			sector_t sector, nr_sects;
 
-			retval = __blkdev_issue_zeroout(vns->host_part,
-				le64_to_cpu(cmd->write_zeroes.slba) << shift,
-				(sector_t)(le16_to_cpu(cmd->write_zeroes.length) + 1)
-					<< shift,
-				GFP_NOIO, &chain,
-				(control & NVME_WZ_DEAC) ? 0 : BLKDEV_ZERO_NOUNMAP);
+			sector = le64_to_cpu(cmd->write_zeroes.slba) << shift;
+			nr_sects = (sector_t)(le16_to_cpu(cmd->write_zeroes.length)
+					      + 1) << shift;
+			retval = __blkdev_issue_zeroout(vns->host_part, sector,
+							nr_sects, GFP_NOIO, &chain,
+							(control & NVME_WZ_DEAC) ?
+							0 : BLKDEV_ZERO_NOUNMAP);
 			if (retval)
 				goto error;
 			mbio->flush_after = control & NVME_RW_FUA;
@@ -363,10 +366,15 @@ int nvme_mdev_hctrl_hq_poll(struct nvme_mdev_hctrl *hctrl,
 		return -1;
 
 	list_for_each_entry_safe(mbio, tmp, &hwq->bios_in_flight, link) {
+		/*
+		 * Acquire, pairs with the release in the completion handlers:
+		 * the data of a completed read is visible once we see it.
+		 */
 		u16 status = smp_load_acquire(&mbio->status);
 
 		if (status == NVME_STATUS_PENDING) {
 			bio_poll(&mbio->bio, NULL, BLK_POLL_ONESHOT);
+			/* as above */
 			status = smp_load_acquire(&mbio->status);
 		}
 		if (status == NVME_STATUS_PENDING)

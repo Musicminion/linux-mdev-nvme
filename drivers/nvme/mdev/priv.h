@@ -115,7 +115,6 @@ struct nvme_mdev_vns {
 
 	u32 nsid;
 
-
 	/* size of each block on the real namespace, same for host and guest */
 	u8 blksize_shift;
 
@@ -386,7 +385,7 @@ struct hw_mbio_queue {
  * and hangs off the "nvme_mdev" class device.
  */
 struct nvme_mdev_hctrl {
-	struct mutex lock;
+	struct mutex lock;	/* protects hw_queues[] */
 
 	/* numa node of the host controller*/
 	int node;
@@ -462,7 +461,6 @@ void nvme_mdev_vctrl_viommu_unmap(struct nvme_mdev_vctrl *vctrl,
 ssize_t nvme_mdev_type_show_description(struct mdev_type *mtype, char *buf);
 void nvme_mdev_hctrl_get(struct nvme_mdev_hctrl *hctrl);
 void nvme_mdev_hctrl_put(struct nvme_mdev_hctrl *hctrl);
-
 
 int nvme_mdev_hctrl_hq_alloc(struct nvme_mdev_hctrl *hctrl);
 void nvme_mdev_hctrl_hq_free(struct nvme_mdev_hctrl *hctrl, u16 qid);

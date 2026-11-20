@@ -153,6 +153,7 @@ static int nvme_mdev_viommu_pin(struct nvme_mdev_viommu *viommu,
 		return ret < 0 ? ret : -EFAULT;
 	}
 
+	/* the page before the bit, see nvme_mdev_viommu_translate() */
 	smp_wmb();
 	set_bit(i, chunk->pinned);
 	return 0;
@@ -271,9 +272,8 @@ int nvme_mdev_viommu_create_kmap(struct nvme_mdev_viommu *viommu,
 
 	new_page = pfn_to_page(PHYS_PFN(physical));
 
-	page->kmap = kmap(new_page);
-	if (!page->kmap)
-		return -ENOMEM;
+	/* long lived (shadow doorbells, PRP lists): 64-bit, no highmem */
+	page->kmap = page_address(new_page);
 
 	page->page = new_page;
 	return 0;
@@ -301,9 +301,7 @@ void nvme_mdev_viommu_update_kmap(struct nvme_mdev_viommu *viommu,
 
 	nvme_mdev_viommu_free_kmap(viommu, page);
 
-	page->kmap = kmap(new_page);
-	if (!page->kmap)
-		return;
+	page->kmap = page_address(new_page);
 	page->page = new_page;
 }
 
@@ -311,9 +309,6 @@ void nvme_mdev_viommu_update_kmap(struct nvme_mdev_viommu *viommu,
 void nvme_mdev_viommu_free_kmap(struct nvme_mdev_viommu *viommu,
 				struct page_map *page)
 {
-	if (page->page) {
-		kunmap(page->page);
-		page->page = NULL;
-		page->kmap = NULL;
-	}
+	page->page = NULL;
+	page->kmap = NULL;
 }
