@@ -3,3 +3,4 @@
 obj-y		+= common/
 obj-y		+= host/
 obj-y		+= target/
+obj-$(CONFIG_NVME_MDEV_VFIO)	+= mdev/
