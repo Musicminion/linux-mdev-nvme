@@ -685,6 +685,11 @@ static int nvme_mdev_adm_handle_get_features(struct adm_ctx *ctx)
 	case NVME_FEAT_ASYNC_EVENT:
 		value = nvme_mdev_event_read_aen_config(vctrl);
 		goto out;
+
+	/* Write Atomicity Normal (mandatory) */
+	case NVME_FEAT_WRITE_ATOMIC:
+		value = vctrl->write_atomicity_dn ? 1 : 0;
+		goto out;
 	default:
 		return DNR(NVME_SC_INVALID_FIELD);
 	}
@@ -761,6 +766,13 @@ static int nvme_mdev_adm_handle_set_features(struct adm_ctx *ctx)
 	case NVME_FEAT_ASYNC_EVENT:
 		nvme_mdev_event_set_aen_config(vctrl, value);
 		return NVME_SC_SUCCESS;
+
+	case NVME_FEAT_WRITE_ATOMIC:
+		/* only DN; AWUN is 0, so this changes nothing */
+		if (value & ~1U)
+			return DNR(NVME_SC_INVALID_FIELD);
+		vctrl->write_atomicity_dn = value & 1;
+		return NVME_SC_SUCCESS;
 	default:
 		return DNR(NVME_SC_INVALID_FIELD);
 	}
@@ -779,15 +791,24 @@ static int nvme_mdev_adm_handle_async_event(struct adm_ctx *ctx)
 	return nvme_mdev_event_request_receive(ctx->vctrl, cid);
 }
 
-/* (Dummy) response to ABORT command*/
+/*
+ * Response to ABORT: we never abort commands (they are already on the
+ * host).  Per spec that is a successful completion with bit 0 of DW0 set
+ * ("command not aborted"); 2019 returned the obsolete Abort Command Is
+ * Missing status instead.
+ */
 static int nvme_mdev_adm_handle_abort(struct adm_ctx *ctx)
 {
+	u16 cid = le16_to_cpu(ctx->in->common.command_id);
+
 	if (!check_reserved_dwords(nvme_mdev_cmd_dwords(ctx->in), 16,
 				   RSRV_NSID | RSRV_DW23 | RSRV_DPTR |
-				   RSRV_MPTR | RSRV_DW10_15))
+				   RSRV_MPTR | RSRV_DW11_15))
 		return DNR(NVME_SC_INVALID_FIELD);
 
-	return DNR(NVME_SC_ABORT_MISSING);
+	/* DW10 holds the SQID and CID to abort (2019 rejected it as reserved) */
+	nvme_mdev_vsq_cmd_done_adm(ctx->vctrl, 1, cid, NVME_SC_SUCCESS);
+	return -1;
 }
 
 /* Process one new command in the admin queue*/

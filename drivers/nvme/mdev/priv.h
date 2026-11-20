@@ -338,6 +338,7 @@ struct nvme_mdev_vctrl {
 
 	/* Settings */
 	unsigned int arb_burst_shift;
+	bool write_atomicity_dn;	/* feature 0x0a, Disable Normal */
 	u8 worload_hint;
 	unsigned int iothread_cpu;
 
@@ -372,6 +373,10 @@ struct mbio {
 
 	/* result NVME status, written by the completion handler */
 	u16 status;
+
+	/* Write Zeroes with FUA: flush once the zeroing is done */
+	bool flush_after;
+	struct block_device *bdev;
 
 	/* must be last for bioset allocation*/
 	struct bio bio;
@@ -805,6 +810,9 @@ static inline int nvme_mdev_translate_error(int error)
 	case -EINVAL:
 		/* Bad prp offsets in the prp lists/command*/
 		return DNR(NVME_SC_PRP_OFFSET_INVALID);
+	case -EPERM:
+		/* backing device is read-only */
+		return DNR(NVME_SC_READ_ONLY);
 	case -ENODEV:
 	case -EBUSY:
 	case -EAGAIN:

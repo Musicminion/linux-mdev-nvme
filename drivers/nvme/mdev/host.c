@@ -873,6 +873,48 @@ static void nvme_mdev_hctrl_bio_done(struct bio *bio)
 	smp_store_release(&mbio->status, status);
 }
 
+/*
+ * Completion of a discard / write zeroes chain built by the block layer
+ * helpers; bi_private is the (never submitted) mbio tracking the command.
+ */
+static void nvme_mdev_hctrl_chain_done(struct bio *bio)
+{
+	struct mbio *mbio = bio->bi_private;
+	u16 status = nvme_mdev_translate_error_block(bio->bi_status);
+
+	bio_put(bio);
+	smp_store_release(&mbio->status, status);
+}
+
+/*
+ * DSM: deallocate the ranges as discards (the ranges were checked and
+ * copied in by the translation); without the AD attribute, or if the
+ * device can't discard, it is only a hint and succeeds as a no-op.
+ */
+static struct bio *nvme_mdev_hctrl_dsm(struct nvme_mdev_vns *vns,
+				       struct nvme_command *cmd,
+				       struct nvme_ext_data_iter *datait)
+{
+	const struct nvme_dsm_range *range = datait->kmem.data;
+	unsigned int i, nr = le32_to_cpu(cmd->dsm.nr) + 1;
+	unsigned int shift = vns->blksize_shift - SECTOR_SHIFT;
+	struct bio *chain = NULL;
+
+	if (!(le32_to_cpu(cmd->dsm.attributes) & NVME_DSMGMT_AD) ||
+	    !bdev_max_discard_sectors(vns->host_part))
+		return NULL;
+
+	for (i = 0; i < nr; i++) {
+		sector_t nr_sects = (sector_t)le32_to_cpu(range[i].nlb) << shift;
+
+		if (nr_sects)
+			__blkdev_issue_discard(vns->host_part,
+					       le64_to_cpu(range[i].slba) << shift,
+					       nr_sects, GFP_NOIO, &chain);
+	}
+	return chain;
+}
+
 /* Submit a IO passthrough command */
 int nvme_mdev_hctrl_hq_submit(struct nvme_mdev_hctrl *hctrl,
 			      struct nvme_mdev_vns *vns,
@@ -949,6 +991,54 @@ int nvme_mdev_hctrl_hq_submit(struct nvme_mdev_hctrl *hctrl,
 				       &hwq->bioset);
 		if (WARN_ON(!bio))
 			return -ENOMEM;
+
+	/* discard / write zeroes: chains built by the block layer helpers */
+	} else if (opcode == nvme_cmd_dsm || opcode == nvme_cmd_write_zeroes) {
+		unsigned int shift = vns->blksize_shift - SECTOR_SHIFT;
+		struct bio *chain = NULL;
+
+		/* tracks the command; never submitted itself (no bdev) */
+		bio = bio_alloc_bioset(NULL, 0, 0, GFP_KERNEL, &hwq->bioset);
+		if (WARN_ON(!bio)) {
+			if (datait && datait->release)
+				datait->release(datait);
+			return -ENOMEM;
+		}
+		mbio = container_of(bio, struct mbio, bio);
+		mbio->tag = tag;
+		mbio->status = NVME_STATUS_PENDING;
+		mbio->flush_after = false;
+		mbio->bdev = vns->host_part;
+
+		if (opcode == nvme_cmd_dsm) {
+			chain = nvme_mdev_hctrl_dsm(vns, cmd, datait);
+			datait->release(datait);
+		} else {
+			u16 control = le16_to_cpu(cmd->write_zeroes.control);
+
+			retval = __blkdev_issue_zeroout(vns->host_part,
+				le64_to_cpu(cmd->write_zeroes.slba) << shift,
+				(sector_t)(le16_to_cpu(cmd->write_zeroes.length) + 1)
+					<< shift,
+				GFP_NOIO, &chain,
+				(control & NVME_WZ_DEAC) ? 0 : BLKDEV_ZERO_NOUNMAP);
+			if (retval)
+				goto error;
+			mbio->flush_after = control & NVME_RW_FUA;
+		}
+
+		list_add_tail(&mbio->link, &hwq->bios_in_flight);
+		hwq->inflight++;
+
+		if (chain) {
+			chain->bi_private = mbio;
+			chain->bi_end_io = nvme_mdev_hctrl_chain_done;
+			submit_bio(chain);
+		} else {
+			/* nothing to do (DSM hint only) */
+			mbio->status = NVME_SC_SUCCESS;
+		}
+		return 0;
 	} else {
 		return -EINVAL;
 	}
@@ -959,6 +1049,8 @@ int nvme_mdev_hctrl_hq_submit(struct nvme_mdev_hctrl *hctrl,
 	mbio = container_of(bio, struct mbio, bio);
 	mbio->tag = tag;
 	mbio->status = NVME_STATUS_PENDING;
+	mbio->flush_after = false;
+	mbio->bdev = vns->host_part;
 
 	list_add_tail(&mbio->link, &hwq->bios_in_flight);
 	hwq->inflight++;
@@ -993,6 +1085,17 @@ int nvme_mdev_hctrl_hq_poll(struct nvme_mdev_hctrl *hctrl,
 		if (status == NVME_STATUS_PENDING)
 			continue;
 
+		/* Write Zeroes with FUA: make the zeroes durable first */
+		if (mbio->flush_after && status == NVME_SC_SUCCESS) {
+			mbio->flush_after = false;
+			mbio->status = NVME_STATUS_PENDING;
+			bio_reset(&mbio->bio, mbio->bdev,
+				  REQ_OP_WRITE | REQ_PREFLUSH);
+			mbio->bio.bi_end_io = nvme_mdev_hctrl_bio_done;
+			submit_bio(&mbio->bio);
+			continue;
+		}
+
 		results[i].tag = mbio->tag;
 		results[i].status = status;
 
@@ -1020,11 +1123,19 @@ static int nvme_mdev_backend_init(void)
 	if (!hctrl)
 		goto err_root;
 
-	/* for now don't deal with bio chaining */
-	hctrl->mdts = ilog2(BIO_MAX_VECS);
+	/*
+	 * 128 pages: stays within the usual max_segments (polled bios that
+	 * the block layer has to split lose REQ_POLLED)
+	 */
+	hctrl->mdts = 7;
 	hctrl->nr_host_queues = MDEV_NVME_NUM_BIO_QUEUES;
-	/* for now no support for write zeros and discard */
-	hctrl->oncs = 0;
+	/*
+	 * ONCS is per controller, namespaces come and go: advertise both.
+	 * DSM is a hint (a no-op on devices that can't discard); Write
+	 * Zeroes falls back to writing zero pages where there is no native
+	 * support, so it is correct for every block device.
+	 */
+	hctrl->oncs = NVME_CTRL_ONCS_DSM | NVME_CTRL_ONCS_WRITE_ZEROES;
 
 	ret = nvme_mdev_hctrl_register(hctrl, nvme_mdev_root_dev);
 	if (ret)
