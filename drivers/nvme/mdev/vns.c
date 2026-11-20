@@ -5,6 +5,7 @@
  */
 #include <linux/kernel.h>
 #include <linux/slab.h>
+#include <linux/log2.h>
 #include <linux/nvme.h>
 #include "priv.h"
 
@@ -75,14 +76,6 @@ static int nvme_mdev_vns_read_host_properties(struct nvme_mdev_vctrl *vctrl,
 
 	vns->ns_size = nr >> sector_to_lba_shift;
 	host_ns_size = get_capacity(bdev->bd_disk) >> sector_to_lba_shift;
-
-#ifdef CONFIG_NVME_MDEV_VFIO_HW_QUEUES
-	/* we talk to the namespace directly: add the partition offset */
-	vns->host_lba_offset = start >> sector_to_lba_shift;
-#else
-	/* the block layer remaps partitions for us */
-	vns->host_lba_offset = 0;
-#endif
 
 	if (vns->ns_size == 0) {
 		_WARN(vctrl, "NS/create: host namespace has size 0\n");
@@ -178,14 +171,7 @@ int nvme_mdev_vns_open(struct nvme_mdev_vctrl *vctrl, const char *path)
 	vns->bdev_file = bdev_file;
 	vns->host_part = file_bdev(bdev_file);
 
-	/* must belong to the host controller we pass I/O to */
-	ret = nvme_mdev_hctrl_check_bdev(vctrl->hctrl, vns->host_part,
-					 &vns->host_nsid, &lba_shift);
-	if (ret) {
-		_WARN(vctrl, "NS/create: %s can't be used with this controller (%d)\n",
-		      path, ret);
-		goto error2;
-	}
+	lba_shift = ilog2(bdev_logical_block_size(vns->host_part));
 
 	/* read properties of the host namespace */
 	ret = nvme_mdev_vns_read_host_properties(vctrl, vns, lba_shift);

@@ -4,36 +4,11 @@ config NVME_MDEV_VFIO
 	depends on BLOCK && VFIO && 64BIT
 	select VFIO_MDEV
 	help
-	  Exposes a host block device (an NVMe namespace or a partition of
-	  it) to a guest as a namespace of a virtual NVMe PCIe controller,
-	  using a VFIO mediated device.  The guest uses its own, unmodified
-	  NVMe driver; the I/O commands are translated and executed by a
-	  polling kernel thread.
+	  Exposes host block devices (e.g. NVMe namespaces or partitions of
+	  them) to a guest as the namespaces of a virtual NVMe PCIe
+	  controller, using a VFIO mediated device.  The guest uses its own,
+	  unmodified NVMe driver; a polling kernel thread translates the I/O
+	  commands and sends them through the block layer as polled bios
+	  (configure poll queues on the host device, e.g. nvme.poll_queues).
 
 	  If unsure, say N.
-
-if NVME_MDEV_VFIO
-
-choice
-	prompt "nvme-mdev I/O backend"
-	default NVME_MDEV_VFIO_HW_QUEUES
-
-config NVME_MDEV_VFIO_HW_QUEUES
-	bool "Dedicated NVMe hardware queues"
-	depends on BLK_DEV_NVME=y || (BLK_DEV_NVME=m && NVME_MDEV_VFIO=m)
-	select NVME_PCI_EXT_QUEUES
-	help
-	  Each virtual controller gets its own submission/completion queue
-	  pairs on the host NVMe controller (reserved with the nvme module
-	  parameter "ext_queues"), bypassing the block layer.  Lowest
-	  latency; only NVMe PCIe namespaces can be used.
-
-config NVME_MDEV_VFIO_GENERIC_IO
-	bool "Block layer (polled bios)"
-	help
-	  Send the I/O through the block layer using polled bios.  Works
-	  with any block device and needs no support from the NVMe driver.
-
-endchoice
-
-endif

@@ -14,15 +14,6 @@ config BLK_DEV_NVME
 	  To compile this driver as a module, choose M here: the
 	  module will be called nvme.
 
-config NVME_PCI_EXT_QUEUES
-	bool
-	depends on BLK_DEV_NVME
-	help
-	  Lets the PCIe driver reserve IO queue pairs (module parameter
-	  "ext_queues") that are kept out of blk-mq and handed to one
-	  in-kernel client, see drivers/nvme/host/pci-ext.h.  Selected by
-	  the nvme-mdev dedicated hardware queue backend.
-
 config NVME_MULTIPATH
 	bool "NVMe multipath support"
 	depends on NVME_CORE

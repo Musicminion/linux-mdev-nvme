@@ -185,13 +185,7 @@ static int nvme_mdev_kdata_iter_next(struct nvme_ext_data_iter *it)
 /* ->release function for kdata iterator to free it after use */
 static void nvme_mdev_kdata_iter_free(struct nvme_ext_data_iter *it)
 {
-	struct device *dma_dev = it->viommu->hw_dev;
-
-	if (dma_dev)
-		dma_free_coherent(dma_dev, it->kmem.size,
-				  it->kmem.data, it->kmem.dma_addr);
-	else
-		kfree(it->kmem.data);
+	kfree(it->kmem.data);
 	kfree(it);
 }
 
@@ -207,14 +201,8 @@ nvme_mdev_kdata_iter_alloc(struct nvme_mdev_viommu *viommu, unsigned int size)
 
 	it->viommu = viommu;
 	it->kmem.size = size;
-	if (viommu->hw_dev) {
-		it->kmem.data = dma_alloc_coherent(viommu->hw_dev, size,
-						   &it->kmem.dma_addr,
-						   GFP_KERNEL);
-	} else {
-		it->kmem.data = kzalloc(size, GFP_KERNEL);
-		it->kmem.dma_addr = 0;
-	}
+	it->kmem.data = kzalloc(size, GFP_KERNEL);
+	it->kmem.dma_addr = 0;
 
 	if (!it->kmem.data) {
 		kfree(it);

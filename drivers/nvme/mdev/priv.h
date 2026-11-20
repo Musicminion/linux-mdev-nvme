@@ -21,10 +21,6 @@
 #include <linux/timex.h>
 #include <linux/dmapool.h>
 #include <linux/byteorder/generic.h>
-#ifdef CONFIG_NVME_MDEV_VFIO_HW_QUEUES
-#include "../host/nvme.h"
-#include "../host/pci-ext.h"
-#endif
 #include "spec.h"
 #include "mdev.h"
 
@@ -43,11 +39,14 @@
 #define MAX_VIRTUAL_NAMESPACES 16 /* NSID = 1..16*/
 #define MAX_VIRTUAL_IRQS 16
 
-#ifndef CONFIG_NVME_MDEV_VFIO_GENERIC_IO
-#define MAX_HOST_QUEUES 4
-#else
+/*
+ * Each virtual controller has one I/O thread and one "host queue": the
+ * list of the bios it has in flight (all its guest queues share it).
+ */
 #define MAX_HOST_QUEUES 1
-#endif
+
+/* how many virtual controllers can be created */
+#define NVME_MDEV_MAX_INSTANCES 16
 
 #define MAX_AER_COMMANDS 16
 #define MAX_LOG_PAGES 16
@@ -109,11 +108,6 @@ struct nvme_mdev_vns {
 
 	u32 nsid;
 
-	/* NSID on the host (dedicated queue backend only) */
-	u32 host_nsid;
-
-	/* Offset inside the host namespace (start of the partition)*/
-	u64 host_lba_offset;
 
 	/* size of each block on the real namespace, same for host and guest */
 	u8 blksize_shift;
@@ -141,7 +135,6 @@ struct nvme_mdev_vns {
 #define NVME_MDEV_CHUNK_PAGES	(1U << (NVME_MDEV_CHUNK_SHIFT - PAGE_SHIFT))
 
 struct nvme_mdev_viommu {
-	struct device *hw_dev;		/* DMA device, NULL for block backend */
 	struct vfio_device *vdev;	/* the VFIO device we pin for */
 
 	/*
@@ -358,11 +351,9 @@ struct nvme_mdev_inst_type {
 	char name[16];
 };
 
-#ifdef CONFIG_NVME_MDEV_VFIO_GENERIC_IO
-
 #define MDEV_NVME_BIO_QUEUE_SIZE 128
 #define NVME_STATUS_PENDING 0xFFFF
-#define MDEV_NVME_NUM_BIO_QUEUES 16
+#define MDEV_NVME_NUM_BIO_QUEUES NVME_MDEV_MAX_INSTANCES
 
 struct mbio {
 	/* link in a list of pending bios*/
@@ -388,70 +379,33 @@ struct hw_mbio_queue {
 	struct bio_set bioset;
 };
 
-#endif
-
-#ifdef CONFIG_NVME_MDEV_VFIO_HW_QUEUES
 /*
- * Dedicated hardware queue backend: we own a whole NVMe queue pair of the
- * host controller, pick the command ids and build the PRP lists ourselves.
+ * The "host": where the virtual controllers' I/O goes.  With the block
+ * layer backend there is one for the whole module; it is the mdev parent
+ * and hangs off the "nvme_mdev" class device.
  */
-#define NVME_MDEV_MAX_PRP_LISTS	8
-
-struct nvme_mdev_hw_iod {
-	u32 tag;			/* (guest sqid << 16) | guest cid */
-	bool inuse;
-	unsigned int nr_lists;
-	struct nvme_ext_data_iter *iter;	/* released on completion */
-	__le64 *lists[NVME_MDEV_MAX_PRP_LISTS];
-	dma_addr_t list_dma[NVME_MDEV_MAX_PRP_LISTS];
-};
-
-struct nvme_mdev_hw_queue {
-	u16 qid;
-	u32 depth;
-	unsigned int inflight;
-	bool lost;			/* host reset: outstanding cmds are gone */
-	unsigned int nr_free;
-	u16 *free_cids;			/* stack of free command ids */
-	struct nvme_mdev_hw_iod *iods;	/* indexed by command id */
-};
-#endif
-
-/*Abstraction of the host controller that we are connected to */
 struct nvme_mdev_hctrl {
 	struct mutex lock;
 
 	/* numa node of the host controller*/
 	int node;
 
-	struct list_head link;
 	struct kref ref;
 	bool removing;
-
-	/* set while the host has taken the queues away (reset) */
-	bool host_stopped;
 
 	/* the device the mdev instances hang off */
 	struct device *parent_dev;
 	struct mdev_parent mparent;
-	struct nvme_mdev_inst_type types[MAX_HOST_QUEUES];
-	struct mdev_type *type_ptrs[MAX_HOST_QUEUES];
+	struct nvme_mdev_inst_type type;
+	struct mdev_type *type_ptrs[1];
 
 	/* Host area*/
 	u16 oncs;
 	u8 mdts;
 	unsigned int id;
 
-	/* book-keeping for number of host queues we can allocate*/
-	unsigned int nr_host_queues;
-
-#ifdef CONFIG_NVME_MDEV_VFIO_HW_QUEUES
-	struct nvme_ctrl *nvme_ctrl;
-	struct dma_pool *prp_pool;
-	struct xarray hw_queues;	/* host qid -> nvme_mdev_hw_queue */
-#else
+	/* one bio list per virtual controller (MAX_HOST_QUEUES each) */
 	struct hw_mbio_queue *hw_queues[MDEV_NVME_NUM_BIO_QUEUES];
-#endif
 };
 
 /* vctrl.c*/
@@ -467,7 +421,6 @@ void nvme_mdev_vctrl_release(struct nvme_mdev_vctrl *vctrl);
 
 void nvme_mdev_vctrl_pause(struct nvme_mdev_vctrl *vctrl);
 void nvme_mdev_vctrl_resume(struct nvme_mdev_vctrl *vctrl);
-void nvme_mdev_vctrl_host_restart(struct nvme_mdev_vctrl *vctrl);
 
 bool nvme_mdev_vctrl_enable(struct nvme_mdev_vctrl *vctrl,
 			    dma_addr_t cqiova, dma_addr_t sqiova, u32 sizes);
@@ -505,23 +458,15 @@ void nvme_mdev_vctrl_viommu_unmap(struct nvme_mdev_vctrl *vctrl,
 				  dma_addr_t iova, u64 size);
 
 /* host.c*/
-unsigned int nvme_mdev_type_get_available(struct mdev_type *mtype);
 ssize_t nvme_mdev_type_show_description(struct mdev_type *mtype, char *buf);
 void nvme_mdev_hctrl_get(struct nvme_mdev_hctrl *hctrl);
 void nvme_mdev_hctrl_put(struct nvme_mdev_hctrl *hctrl);
 
-int nvme_mdev_hctrl_hqs_available(struct nvme_mdev_hctrl *hctrl);
-
-bool nvme_mdev_hctrl_hqs_reserve(struct nvme_mdev_hctrl *hctrl,
-				 unsigned int n);
-void nvme_mdev_hctrl_hqs_unreserve(struct nvme_mdev_hctrl *hctrl,
-				   unsigned int n);
 
 int nvme_mdev_hctrl_hq_alloc(struct nvme_mdev_hctrl *hctrl);
 void nvme_mdev_hctrl_hq_free(struct nvme_mdev_hctrl *hctrl, u16 qid);
 bool nvme_mdev_hctrl_hq_can_submit(struct nvme_mdev_hctrl *hctrl, u16 qid);
 bool nvme_mdev_hctrl_hq_check_op(struct nvme_mdev_hctrl *hctrl, u8 optcode);
-void nvme_mdev_hctrl_hq_mark_lost(struct nvme_mdev_hctrl *hctrl, u16 qid);
 
 int nvme_mdev_hctrl_hq_submit(struct nvme_mdev_hctrl *hctrl,
 			      struct nvme_mdev_vns *vns,
@@ -533,10 +478,6 @@ int nvme_mdev_hctrl_hq_poll(struct nvme_mdev_hctrl *hctrl,
 			    u32 qid,
 			    struct nvme_ext_cmd_result *results,
 			    unsigned int max_len);
-
-int nvme_mdev_hctrl_check_bdev(struct nvme_mdev_hctrl *hctrl,
-			       struct block_device *bdev,
-			       u32 *host_nsid, unsigned int *lba_shift);
 
 /* instance.c */
 extern struct mdev_driver nvme_mdev_driver;
@@ -691,8 +632,7 @@ void *nvme_mdev_udata_queue_vmap(struct nvme_mdev_viommu *viommu,
 				 unsigned int size, bool cont);
 /* viommu.c */
 void nvme_mdev_viommu_init(struct nvme_mdev_viommu *viommu,
-			   struct vfio_device *vdev,
-			   struct device *hw_dev);
+			   struct vfio_device *vdev);
 
 int nvme_mdev_viommu_remove(struct nvme_mdev_viommu *viommu,
 			    dma_addr_t iova, u64 size);

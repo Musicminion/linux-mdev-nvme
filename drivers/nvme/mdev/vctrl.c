@@ -103,17 +103,13 @@ int nvme_mdev_vctrl_create(struct nvme_mdev_vctrl *vctrl,
 	INIT_WORK(&vctrl->ns_gc_work, nvme_mdev_vns_gc_work);
 	nvme_mdev_vctrl_init_id(vctrl);
 
-	/* reserve host IO queues */
-	if (!nvme_mdev_hctrl_hqs_reserve(hctrl, max_host_queues))
-		return -ENOSPC;
-
 	/* default feature values*/
 	vctrl->arb_burst_shift = 3;
 	vctrl->mmio.shadow_db_supported = use_shadow_doorbell;
 
 	ret = nvme_mdev_pci_create(vctrl);
 	if (ret)
-		goto error1;
+		return ret;
 
 	ret = nvme_mdev_mmio_create(vctrl);
 	if (ret)
@@ -135,8 +131,6 @@ error3:
 	nvme_mdev_mmio_free(vctrl);
 error2:
 	nvme_mdev_pci_free(vctrl);
-error1:
-	nvme_mdev_hctrl_hqs_unreserve(hctrl, max_host_queues);
 	return ret;
 }
 
@@ -165,7 +159,6 @@ void nvme_mdev_vctrl_destroy(struct nvme_mdev_vctrl *vctrl)
 
 	mutex_lock(&vctrl->lock);
 	__nvme_mdev_vctrl_reset(vctrl, true);
-	nvme_mdev_hctrl_hqs_unreserve(vctrl->hctrl, vctrl->max_host_hw_queues);
 	nvme_mdev_pci_free(vctrl);
 	nvme_mdev_mmio_free(vctrl);
 	mutex_unlock(&vctrl->lock);
@@ -218,28 +211,9 @@ void nvme_mdev_vctrl_resume(struct nvme_mdev_vctrl *vctrl)
 	mutex_unlock(&vctrl->lock);
 }
 
-/*
- * The host controller came back from a reset.  Commands we had sent to it
- * are gone; make the I/O thread complete them to the guest (with an abort
- * status, so the guest retries them).  Called with the vctrl paused.
- */
-void nvme_mdev_vctrl_host_restart(struct nvme_mdev_vctrl *vctrl)
-{
-	struct nvme_mdev_hq *hq;
-
-	mutex_lock(&vctrl->lock);
-	list_for_each_entry(hq, &vctrl->host_hw_queues, link)
-		nvme_mdev_hctrl_hq_mark_lost(vctrl->hctrl, hq->hqid);
-	/* the I/O thread has to run to deliver the aborts */
-	if (!list_empty(&vctrl->host_hw_queues))
-		WRITE_ONCE(vctrl->io_idle, false);
-	mutex_unlock(&vctrl->lock);
-}
-
 /* Called when emulator opens the virtual device */
 int nvme_mdev_vctrl_open(struct nvme_mdev_vctrl *vctrl)
 {
-	struct device *dma_dev = NULL;
 	int ret = 0;
 
 	mutex_lock(&vctrl->lock);
@@ -256,11 +230,7 @@ int nvme_mdev_vctrl_open(struct nvme_mdev_vctrl *vctrl)
 
 	_INFO(vctrl, "device is opened\n");
 
-#ifdef CONFIG_NVME_MDEV_VFIO_HW_QUEUES
-	/* guest memory is DMA mapped for the host NVMe device */
-	dma_dev = vctrl->hctrl->nvme_ctrl->dev;
-#endif
-	nvme_mdev_viommu_init(&vctrl->viommu, &vctrl->vdev, dma_dev);
+	nvme_mdev_viommu_init(&vctrl->viommu, &vctrl->vdev);
 
 	nvme_mdev_mmio_open(vctrl);
 	vctrl->inuse = true;

@@ -9,8 +9,8 @@
  * IOMMU_IOAS_MAP): "guest address X is user address Y".  For an emulated
  * IOMMU device like this one nothing is pinned at that point.  We pin the
  * pages we actually touch with vfio_pin_pages(), which also accounts them
- * against the user's locked memory limit, and DMA map them for the host
- * NVMe device.  When the VMM removes a mapping, VFIO calls our dma_unmap
+ * against the user's locked memory limit (the block layer DMA maps them
+ * per I/O).  When the VMM removes a mapping, VFIO calls our dma_unmap
  * callback and we must unpin everything in that range before returning.
  *
  * Pinning is done in naturally aligned chunks of NVME_MDEV_CHUNK_PAGES
@@ -37,7 +37,6 @@ struct nvme_mdev_chunk {
 	bool whole;			/* pinned with one vfio_pin_pages() */
 	DECLARE_BITMAP(pinned, NVME_MDEV_CHUNK_PAGES);
 	struct page *pages[NVME_MDEV_CHUNK_PAGES];
-	dma_addr_t *dma;		/* per page, NULL without hw_dev */
 };
 
 #define CHUNK_PROT (IOMMU_READ | IOMMU_WRITE)
@@ -58,50 +57,19 @@ static inline dma_addr_t chunk_page_iova(struct nvme_mdev_chunk *chunk,
 	return chunk->iova + ((dma_addr_t)i << PAGE_SHIFT);
 }
 
-/* DMA map page @i of the chunk for the host device */
-static int nvme_mdev_chunk_map_page(struct nvme_mdev_viommu *viommu,
-				    struct nvme_mdev_chunk *chunk,
-				    unsigned int i)
-{
-	dma_addr_t dma;
-
-	if (!viommu->hw_dev)
-		return 0;
-
-	dma = dma_map_page(viommu->hw_dev, chunk->pages[i], 0, PAGE_SIZE,
-			   DMA_BIDIRECTIONAL);
-	if (dma_mapping_error(viommu->hw_dev, dma))
-		return -ENOMEM;
-	chunk->dma[i] = dma;
-	return 0;
-}
-
-static void nvme_mdev_chunk_unmap_page(struct nvme_mdev_viommu *viommu,
-				       struct nvme_mdev_chunk *chunk,
-				       unsigned int i)
-{
-	if (viommu->hw_dev)
-		dma_unmap_page(viommu->hw_dev, chunk->dma[i], PAGE_SIZE,
-			       DMA_BIDIRECTIONAL);
-}
-
-/* Unmap and unpin everything of a chunk and free it */
+/* Unpin everything of a chunk and free it */
 static void nvme_mdev_chunk_free(struct nvme_mdev_viommu *viommu,
 				 struct nvme_mdev_chunk *chunk)
 {
 	unsigned int i;
 
-	for_each_set_bit(i, chunk->pinned, NVME_MDEV_CHUNK_PAGES) {
-		nvme_mdev_chunk_unmap_page(viommu, chunk, i);
-		if (!chunk->whole)
-			vfio_unpin_pages(viommu->vdev, chunk_page_iova(chunk, i),
-					 1);
-	}
 	if (chunk->whole)
 		vfio_unpin_pages(viommu->vdev, chunk->iova,
 				 NVME_MDEV_CHUNK_PAGES);
-
-	kfree(chunk->dma);
+	else
+		for_each_set_bit(i, chunk->pinned, NVME_MDEV_CHUNK_PAGES)
+			vfio_unpin_pages(viommu->vdev, chunk_page_iova(chunk, i),
+					 1);
 	kvfree(chunk);
 }
 
@@ -109,7 +77,6 @@ static void nvme_mdev_chunk_free(struct nvme_mdev_viommu *viommu,
 static void nvme_mdev_chunk_pin_whole(struct nvme_mdev_viommu *viommu,
 				      struct nvme_mdev_chunk *chunk)
 {
-	unsigned int i;
 	int ret;
 
 	ret = vfio_pin_pages(viommu->vdev, chunk->iova, NVME_MDEV_CHUNK_PAGES,
@@ -119,16 +86,6 @@ static void nvme_mdev_chunk_pin_whole(struct nvme_mdev_viommu *viommu,
 		if (WARN_ON_ONCE(ret > 0))
 			vfio_unpin_pages(viommu->vdev, chunk->iova, ret);
 		return;
-	}
-
-	for (i = 0; i < NVME_MDEV_CHUNK_PAGES; i++) {
-		if (nvme_mdev_chunk_map_page(viommu, chunk, i)) {
-			while (i--)
-				nvme_mdev_chunk_unmap_page(viommu, chunk, i);
-			vfio_unpin_pages(viommu->vdev, chunk->iova,
-					 NVME_MDEV_CHUNK_PAGES);
-			return;
-		}
 	}
 	chunk->whole = true;
 	/* publish the pages before the bits, see nvme_mdev_viommu_translate */
@@ -168,21 +125,10 @@ static int nvme_mdev_viommu_pin(struct nvme_mdev_viommu *viommu,
 
 	chunk = xa_load(&viommu->chunks, idx);
 	if (!chunk) {
-		chunk = kvzalloc_node(sizeof(*chunk), GFP_KERNEL,
-				      viommu->hw_dev ?
-				      dev_to_node(viommu->hw_dev) :
-				      NUMA_NO_NODE);
+		chunk = kvzalloc(sizeof(*chunk), GFP_KERNEL);
 		if (!chunk)
 			return -ENOMEM;
 		chunk->iova = (dma_addr_t)idx << NVME_MDEV_CHUNK_SHIFT;
-		if (viommu->hw_dev) {
-			chunk->dma = kcalloc(NVME_MDEV_CHUNK_PAGES,
-					     sizeof(*chunk->dma), GFP_KERNEL);
-			if (!chunk->dma) {
-				kvfree(chunk);
-				return -ENOMEM;
-			}
-		}
 
 		if (!nvme_mdev_viommu_blocked(viommu, chunk->iova,
 					      NVME_MDEV_CHUNK_PAGES << PAGE_SHIFT))
@@ -207,12 +153,6 @@ static int nvme_mdev_viommu_pin(struct nvme_mdev_viommu *viommu,
 		return ret < 0 ? ret : -EFAULT;
 	}
 
-	ret = nvme_mdev_chunk_map_page(viommu, chunk, i);
-	if (ret) {
-		vfio_unpin_pages(viommu->vdev, chunk_page_iova(chunk, i), 1);
-		return ret;
-	}
-
 	smp_wmb();
 	set_bit(i, chunk->pinned);
 	return 0;
@@ -220,11 +160,9 @@ static int nvme_mdev_viommu_pin(struct nvme_mdev_viommu *viommu,
 
 /* User memory init code*/
 void nvme_mdev_viommu_init(struct nvme_mdev_viommu *viommu,
-			   struct vfio_device *vdev,
-			   struct device *hw_dev)
+			   struct vfio_device *vdev)
 {
 	viommu->vdev = vdev;
-	viommu->hw_dev = hw_dev;
 	nvme_mdev_viommu_unblock_range(viommu);
 	WARN_ON(!xa_empty(&viommu->chunks));
 }
@@ -312,7 +250,7 @@ int nvme_mdev_viommu_translate(struct nvme_mdev_viommu *viommu,
 	smp_rmb();
 
 	*physical = page_to_phys(chunk->pages[i]);
-	*host_iova = chunk->dma ? chunk->dma[i] : 0;
+	*host_iova = 0;		/* unused: the block layer maps the pages */
 	return 0;
 }
 

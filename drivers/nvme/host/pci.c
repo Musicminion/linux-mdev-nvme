@@ -30,7 +30,6 @@
 
 #include "trace.h"
 #include "nvme.h"
-#include "pci-ext.h"
 
 #define SQ_SIZE(q)	((q)->q_depth << (q)->sqes)
 #define CQ_SIZE(q)	((q)->q_depth * sizeof(struct nvme_completion))
@@ -129,13 +128,6 @@ static unsigned int poll_queues;
 module_param_cb(poll_queues, &io_queue_count_ops, &poll_queues, 0644);
 MODULE_PARM_DESC(poll_queues, "Number of queues to use for polled IO.");
 
-#ifdef CONFIG_NVME_PCI_EXT_QUEUES
-static unsigned int ext_queues;
-module_param_cb(ext_queues, &io_queue_count_ops, &ext_queues, 0644);
-MODULE_PARM_DESC(ext_queues,
-	"Number of IO queues reserved for an in-kernel user (nvme-mdev).");
-#endif
-
 static bool noacpi;
 module_param(noacpi, bool, 0444);
 MODULE_PARM_DESC(noacpi, "disable acpi bios quirks");
@@ -198,45 +190,8 @@ struct nvme_dev {
 	unsigned int nr_allocated_queues;
 	unsigned int nr_write_queues;
 	unsigned int nr_poll_queues;
-#ifdef CONFIG_NVME_PCI_EXT_QUEUES
-	/* IO queues kept out of blk-mq for an in-kernel user, see pci-ext.h */
-	unsigned int nr_ext_queues;	/* requested, sampled at reset */
-	unsigned int ext_qid_first;
-	unsigned int ext_qid_count;
-#endif
 	struct nvme_descriptor_pools descriptor_pools[];
 };
-
-static inline unsigned int nvme_ext_nr_queues(struct nvme_dev *dev)
-{
-#ifdef CONFIG_NVME_PCI_EXT_QUEUES
-	return dev->nr_ext_queues;
-#else
-	return 0;
-#endif
-}
-
-static inline bool nvme_ext_qid(struct nvme_dev *dev, unsigned int qid)
-{
-#ifdef CONFIG_NVME_PCI_EXT_QUEUES
-	return qid >= dev->ext_qid_first &&
-		qid < dev->ext_qid_first + dev->ext_qid_count;
-#else
-	return false;
-#endif
-}
-
-#ifdef CONFIG_NVME_PCI_EXT_QUEUES
-static BLOCKING_NOTIFIER_HEAD(nvme_pci_ext_chain);
-#endif
-
-static inline void nvme_ext_notify(struct nvme_dev *dev,
-				   enum nvme_pci_ext_event event)
-{
-#ifdef CONFIG_NVME_PCI_EXT_QUEUES
-	blocking_notifier_call_chain(&nvme_pci_ext_chain, event, &dev->ctrl);
-#endif
-}
 
 static int io_queue_depth_set(const char *val, const struct kernel_param *kp)
 {
@@ -287,7 +242,6 @@ struct nvme_queue {
 #define NVMEQ_SQ_CMB		1
 #define NVMEQ_DELETE_ERROR	2
 #define NVMEQ_POLLED		3
-#define NVMEQ_EXTERNAL		4	/* owned by the in-kernel user */
 	__le32 *dbbuf_sq_db;
 	__le32 *dbbuf_cq_db;
 	__le32 *dbbuf_sq_ei;
@@ -1914,8 +1868,6 @@ static void nvme_reap_pending_cqes(struct nvme_dev *dev)
 	int i;
 
 	for (i = dev->ctrl.queue_count - 1; i > 0; i--) {
-		if (nvme_ext_qid(dev, i))
-			continue;
 		spin_lock(&dev->queues[i].cq_poll_lock);
 		nvme_poll_cq(&dev->queues[i], NULL);
 		spin_unlock(&dev->queues[i].cq_poll_lock);
@@ -2263,8 +2215,7 @@ static int nvme_create_io_queues(struct nvme_dev *dev)
 	}
 
 	max = min(dev->max_qid, dev->ctrl.queue_count - 1);
-	if (max != 1 &&
-	    (dev->io_queues[HCTX_TYPE_POLL] || nvme_ext_nr_queues(dev))) {
+	if (max != 1 && dev->io_queues[HCTX_TYPE_POLL]) {
 		rw_queues = dev->io_queues[HCTX_TYPE_DEFAULT] +
 				dev->io_queues[HCTX_TYPE_READ];
 	} else {
@@ -2781,14 +2732,14 @@ static unsigned int nvme_max_io_queues(struct nvme_dev *dev)
 	if (dev->ctrl.quirks & NVME_QUIRK_SHARED_TAGS)
 		return 1;
 	return blk_mq_num_possible_queues(0) + dev->nr_write_queues +
-		dev->nr_poll_queues + nvme_ext_nr_queues(dev);
+		dev->nr_poll_queues;
 }
 
 static int nvme_setup_io_queues(struct nvme_dev *dev)
 {
 	struct nvme_queue *adminq = &dev->queues[0];
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
-	unsigned int nr_io_queues, ext;
+	unsigned int nr_io_queues;
 	unsigned long size;
 	int result;
 
@@ -2798,9 +2749,6 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 	 */
 	dev->nr_write_queues = write_queues;
 	dev->nr_poll_queues = poll_queues;
-#ifdef CONFIG_NVME_PCI_EXT_QUEUES
-	dev->nr_ext_queues = ext_queues;
-#endif
 
 	/*
 	 * The initial number of allocated queue slots may be too large if the
@@ -2863,15 +2811,7 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 	 */
 	pci_free_irq_vectors(pdev);
 
-	/*
-	 * External queues come out of what the controller granted, leaving at
-	 * least one I/O queue to blk-mq, and go after the poll queues.  They
-	 * need no interrupt vector.  Recomputed on every retry with fewer
-	 * queues (doorbell BAR too small, Create SQ/CQ failures).
-	 */
-	ext = min(nvme_ext_nr_queues(dev), nr_io_queues - 1);
-
-	result = nvme_setup_irqs(dev, nr_io_queues - ext);
+	result = nvme_setup_irqs(dev, nr_io_queues);
 	if (result <= 0) {
 		result = -EIO;
 		goto out_unlock;
@@ -2879,11 +2819,7 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 
 	dev->num_vecs = result;
 	result = max(result - 1, 1);
-	dev->max_qid = result + dev->io_queues[HCTX_TYPE_POLL] + ext;
-#ifdef CONFIG_NVME_PCI_EXT_QUEUES
-	dev->ext_qid_first = dev->max_qid - ext + 1;
-	dev->ext_qid_count = ext;
-#endif
+	dev->max_qid = result + dev->io_queues[HCTX_TYPE_POLL];
 
 	/*
 	 * Should investigate if there's a performance win from allocating
@@ -2914,8 +2850,6 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 					dev->io_queues[HCTX_TYPE_DEFAULT],
 					dev->io_queues[HCTX_TYPE_READ],
 					dev->io_queues[HCTX_TYPE_POLL]);
-	if (ext)
-		dev_info(dev->ctrl.device, "%u external queues\n", ext);
 	return 0;
 out_unlock:
 	mutex_unlock(&dev->shutdown_lock);
@@ -3146,7 +3080,6 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
 	bool dead;
 
 	mutex_lock(&dev->shutdown_lock);
-	nvme_ext_notify(dev, NVME_PCI_EXT_CTRL_STOP);
 	dead = nvme_pci_ctrl_is_dead(dev);
 	if (state == NVME_CTRL_LIVE || state == NVME_CTRL_RESETTING) {
 		if (pci_is_enabled(pdev))
@@ -3321,7 +3254,6 @@ static void nvme_reset_work(struct work_struct *work)
 	}
 
 	nvme_start_ctrl(&dev->ctrl);
-	nvme_ext_notify(dev, NVME_PCI_EXT_CTRL_LIVE);
 	return;
 
  out_unlock:
@@ -3411,150 +3343,6 @@ static const struct nvme_ctrl_ops nvme_pci_ctrl_ops = {
 	.supports_pci_p2pdma	= nvme_pci_supports_pci_p2pdma,
 	.get_virt_boundary	= nvme_pci_get_virt_boundary,
 };
-
-#ifdef CONFIG_NVME_PCI_EXT_QUEUES
-/*
- * External I/O queues, see pci-ext.h.  They are ordinary polled queues
- * after the blk-mq ones.  The tag set still covers them (it is sized from
- * ctrl->queue_count), but no CPU is mapped to their hctxs, so blk-mq never
- * queues a request there.  NVMEQ_EXTERNAL marks the ones handed out.
- */
-static struct pci_driver nvme_driver;
-
-static int nvme_ext_replay_live(struct device *d, void *data)
-{
-	struct notifier_block *nb = data;
-	struct nvme_dev *dev;
-
-	device_lock(d);
-	dev = dev_get_drvdata(d);
-	if (dev && nvme_ctrl_state(&dev->ctrl) == NVME_CTRL_LIVE)
-		nb->notifier_call(nb, NVME_PCI_EXT_CTRL_LIVE, &dev->ctrl);
-	device_unlock(d);
-	return 0;
-}
-
-int nvme_pci_ext_register_notifier(struct notifier_block *nb)
-{
-	int ret = blocking_notifier_chain_register(&nvme_pci_ext_chain, nb);
-
-	if (ret)
-		return ret;
-	/* tell the new user about the controllers that are already up */
-	return driver_for_each_device(&nvme_driver.driver, NULL, nb,
-				      nvme_ext_replay_live);
-}
-EXPORT_SYMBOL_NS_GPL(nvme_pci_ext_register_notifier, "NVME_PCI_EXT");
-
-void nvme_pci_ext_unregister_notifier(struct notifier_block *nb)
-{
-	blocking_notifier_chain_unregister(&nvme_pci_ext_chain, nb);
-}
-EXPORT_SYMBOL_NS_GPL(nvme_pci_ext_unregister_notifier, "NVME_PCI_EXT");
-
-static struct nvme_dev *nvme_ext_dev(struct nvme_ctrl *ctrl)
-{
-	if (WARN_ON_ONCE(ctrl->ops != &nvme_pci_ctrl_ops))
-		return NULL;
-	return to_nvme_dev(ctrl);
-}
-
-unsigned int nvme_pci_ext_queues_available(struct nvme_ctrl *ctrl)
-{
-	struct nvme_dev *dev = nvme_ext_dev(ctrl);
-	unsigned int qid, n = 0;
-
-	for (qid = dev ? dev->ext_qid_first : 0; dev && nvme_ext_qid(dev, qid);
-	     qid++)
-		n += !test_bit(NVMEQ_EXTERNAL, &dev->queues[qid].flags);
-	return n;
-}
-EXPORT_SYMBOL_NS_GPL(nvme_pci_ext_queues_available, "NVME_PCI_EXT");
-
-int nvme_pci_ext_queue_alloc(struct nvme_ctrl *ctrl, u16 *qidp, u32 *depth)
-{
-	struct nvme_dev *dev = nvme_ext_dev(ctrl);
-	unsigned int qid;
-
-	for (qid = dev ? dev->ext_qid_first : 0; dev && nvme_ext_qid(dev, qid);
-	     qid++) {
-		if (test_and_set_bit(NVMEQ_EXTERNAL, &dev->queues[qid].flags))
-			continue;
-		*qidp = qid;
-		*depth = dev->queues[qid].q_depth;
-		return 0;
-	}
-	return -ENOSPC;
-}
-EXPORT_SYMBOL_NS_GPL(nvme_pci_ext_queue_alloc, "NVME_PCI_EXT");
-
-void nvme_pci_ext_queue_free(struct nvme_ctrl *ctrl, u16 qid)
-{
-	struct nvme_dev *dev = nvme_ext_dev(ctrl);
-
-	if (dev && !WARN_ON(!qid || qid >= dev->nr_allocated_queues))
-		WARN_ON(!test_and_clear_bit(NVMEQ_EXTERNAL,
-					    &dev->queues[qid].flags));
-}
-EXPORT_SYMBOL_NS_GPL(nvme_pci_ext_queue_free, "NVME_PCI_EXT");
-
-static struct nvme_queue *nvme_ext_queue(struct nvme_ctrl *ctrl, u16 qid)
-{
-	struct nvme_dev *dev = to_nvme_dev(ctrl);
-
-	if (unlikely(!nvme_ext_qid(dev, qid) ||
-		     !test_bit(NVMEQ_EXTERNAL, &dev->queues[qid].flags)))
-		return NULL;
-	return &dev->queues[qid];
-}
-
-int nvme_pci_ext_queue_submit(struct nvme_ctrl *ctrl, u16 qid,
-			      struct nvme_command *cmd)
-{
-	struct nvme_queue *nvmeq = nvme_ext_queue(ctrl, qid);
-	int ret = 0;
-
-	if (unlikely(!nvmeq))
-		return -EINVAL;
-
-	spin_lock(&nvmeq->sq_lock);
-	if (likely(test_bit(NVMEQ_ENABLED, &nvmeq->flags))) {
-		nvme_sq_copy_cmd(nvmeq, cmd);
-		nvme_write_sq_db(nvmeq, true);
-	} else {
-		ret = -ENODEV;
-	}
-	spin_unlock(&nvmeq->sq_lock);
-	return ret;
-}
-EXPORT_SYMBOL_NS_GPL(nvme_pci_ext_queue_submit, "NVME_PCI_EXT");
-
-int nvme_pci_ext_queue_poll(struct nvme_ctrl *ctrl, u16 qid,
-			    struct nvme_completion *cqes, unsigned int max)
-{
-	struct nvme_queue *nvmeq = nvme_ext_queue(ctrl, qid);
-	unsigned int n = 0;
-
-	if (unlikely(!nvmeq))
-		return -EINVAL;
-	if (!nvme_cqe_pending(nvmeq))
-		return 0;
-
-	spin_lock(&nvmeq->cq_poll_lock);
-	if (likely(test_bit(NVMEQ_ENABLED, &nvmeq->flags))) {
-		while (n < max && nvme_cqe_pending(nvmeq)) {
-			dma_rmb();	/* see nvme_poll_cq() */
-			cqes[n++] = nvmeq->cqes[nvmeq->cq_head];
-			nvme_update_cq_head(nvmeq);
-		}
-		if (n)
-			nvme_ring_cq_doorbell(nvmeq);
-	}
-	spin_unlock(&nvmeq->cq_poll_lock);
-	return n;
-}
-EXPORT_SYMBOL_NS_GPL(nvme_pci_ext_queue_poll, "NVME_PCI_EXT");
-#endif /* CONFIG_NVME_PCI_EXT_QUEUES */
 
 static int nvme_dev_map(struct nvme_dev *dev)
 {
@@ -3666,9 +3454,6 @@ static struct nvme_dev *nvme_pci_alloc_dev(struct pci_dev *pdev,
 
 	dev->nr_write_queues = write_queues;
 	dev->nr_poll_queues = poll_queues;
-#ifdef CONFIG_NVME_PCI_EXT_QUEUES
-	dev->nr_ext_queues = ext_queues;
-#endif
 	dev->nr_allocated_queues = nvme_max_io_queues(dev) + 1;
 	dev->queues = kcalloc_node(dev->nr_allocated_queues,
 			sizeof(struct nvme_queue), GFP_KERNEL, node);
@@ -3803,7 +3588,6 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	pci_set_drvdata(pdev, dev);
 
 	nvme_start_ctrl(&dev->ctrl);
-	nvme_ext_notify(dev, NVME_PCI_EXT_CTRL_LIVE);
 	nvme_put_ctrl(&dev->ctrl);
 	flush_work(&dev->ctrl.scan_work);
 	return 0;
@@ -3864,7 +3648,6 @@ static void nvme_remove(struct pci_dev *pdev)
 {
 	struct nvme_dev *dev = pci_get_drvdata(pdev);
 
-	nvme_ext_notify(dev, NVME_PCI_EXT_CTRL_REMOVE);
 	nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_DELETING);
 	pci_set_drvdata(pdev, NULL);
 

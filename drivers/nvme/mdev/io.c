@@ -69,11 +69,7 @@ static int nvme_mdev_io_translate_rw(struct io_ctx *ctx)
 	if (!check_range(slba, length, ctx->ns->ns_size))
 		return DNR(NVME_SC_LBA_RANGE);
 
-#ifndef CONFIG_NVME_MDEV_VFIO_GENERIC_IO
-	ctx->out.rw.slba = cpu_to_le64(slba + ctx->ns->host_lba_offset);
-#else
 	ctx->out.rw.slba = in->slba;
-#endif
 	ctx->out.rw.length = in->length;
 
 	ret = nvme_mdev_udata_iter_set_dptr(&ctx->udatait, &in->dptr,
@@ -132,8 +128,7 @@ static int nvme_mdev_io_translate_write_zeros(struct io_ctx *ctx)
 	if (!check_range(slba, length, ctx->ns->ns_size))
 		return DNR(NVME_SC_LBA_RANGE);
 
-	ctx->out.write_zeroes.slba =
-		cpu_to_le64(slba + ctx->ns->host_lba_offset);
+	ctx->out.write_zeroes.slba = in->slba;
 	ctx->out.write_zeroes.length = in->length;
 
 	if (control & ~(NVME_RW_LR | NVME_RW_FUA | NVME_WZ_DEAC))
@@ -197,10 +192,6 @@ static int nvme_mdev_io_translate_dsm(struct io_ctx *ctx)
 
 		_DBG(ctx->vctrl, "IOQ: DSM_MANAGEMENT: RANGE 0x%llx-0x%x\n",
 		     slba, nlb);
-
-#ifndef CONFIG_NVME_MDEV_VFIO_GENERIC_IO
-		data_ptr[i].slba = cpu_to_le64(slba + ctx->ns->host_lba_offset);
-#endif
 	}
 
 	ctx->out.dsm.attributes = in->attributes;
@@ -233,7 +224,6 @@ static int nvme_mdev_io_translate_cmd(struct io_ctx *ctx)
 	if (!ctx->ns->readonly && bdev_read_only(ctx->ns->host_part))
 		ctx->ns->readonly = true;
 
-	ctx->out.common.nsid = cpu_to_le32(ctx->ns->host_nsid);
 
 	switch (ctx->in->common.opcode) {
 	case nvme_cmd_flush:
@@ -358,6 +348,7 @@ static void nvme_mdev_io_polling_loop(struct io_ctx *ctx)
 	struct nvme_mdev_vctrl *vctrl = ctx->vctrl;
 	u16 i, cqid, sqid, hsqcnt;
 	u16 hsqs[MAX_HOST_QUEUES];
+	struct blk_plug plug;
 	bool idle = false;
 
 	hsqcnt = nvme_mdev_vctrl_hqs_list(vctrl, hsqs);
@@ -380,12 +371,17 @@ static void nvme_mdev_io_polling_loop(struct io_ctx *ctx)
 			if (nvme_mdev_adm_needs_processing(ctx))
 				break;
 
-		/* process the submission queues*/
+		/*
+		 * process the submission queues; plugged, so that the block
+		 * layer hands the batch to the driver at once (->queue_rqs)
+		 */
+		blk_start_plug(&plug);
 		sqid = 1;
 		for_each_set_bit_from(sqid, vctrl->vsq_en, MAX_VIRTUAL_QUEUES)
 			for (i = 0 ; i < ctx->arb_burst ; i++)
 				if (!nvme_mdev_io_process_sq(ctx, sqid))
 					break;
+		blk_finish_plug(&plug);
 
 		/* process the completions from the guest*/
 		cqid = 1;
@@ -414,13 +410,8 @@ static void nvme_mdev_io_polling_loop(struct io_ctx *ctx)
 
 		vctrl->now = ktime_get();
 
-		/*
-		 * Nothing to wait for if the guest killed the controller, or
-		 * the host is resetting its controller (the outstanding
-		 * commands are completed as aborted once it is back).
-		 */
-		if (nvme_mdev_vctrl_is_dead(vctrl) ||
-		    READ_ONCE(ctx->hctrl->host_stopped)) {
+		/* nothing to wait for if the guest killed the controller */
+		if (nvme_mdev_vctrl_is_dead(vctrl)) {
 			idle = false;
 			break;
 		}
