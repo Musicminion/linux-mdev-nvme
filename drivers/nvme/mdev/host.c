@@ -17,26 +17,6 @@
 #include <linux/log2.h>
 #include "priv.h"
 
-unsigned int io_timeout_ms = 30000;
-module_param_named(io_timeout, io_timeout_ms, uint, 0644);
-MODULE_PARM_DESC(io_timeout,
-		 "Maximum I/O command completion timeout (in msec)");
-
-unsigned int poll_timeout_ms = 500;
-module_param_named(poll_timeout, poll_timeout_ms, uint, 0644);
-MODULE_PARM_DESC(poll_timeout,
-		 "Maximum idle time to keep polling (in msec) (0 - poll forever)");
-
-unsigned int admin_poll_rate_ms = 100;
-module_param_named(admin_poll_rate, admin_poll_rate_ms, uint, 0644);
-MODULE_PARM_DESC(admin_poll_rate,
-		 "Admin queue polling rate (in msec) (used only when shadow doorbell is disabled)");
-
-bool use_shadow_doorbell = true;
-module_param(use_shadow_doorbell, bool, 0644);
-MODULE_PARM_DESC(use_shadow_doorbell,
-		 "Enable the shadow doorbell NVMe extension");
-
 /* ------------------------------------------------------------------ */
 /* the parent device and the instance type */
 

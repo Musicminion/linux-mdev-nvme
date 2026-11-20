@@ -27,7 +27,6 @@ struct io_ctx {
 	ktime_t last_io_t;
 	ktime_t last_admin_poll_time;
 	unsigned int idle_timeout_ms;
-	unsigned int admin_poll_rate_ms;
 	unsigned int arb_burst;
 };
 
@@ -35,7 +34,7 @@ struct io_ctx {
 static bool nvme_mdev_adm_needs_processing(struct io_ctx *ctx)
 {
 	if (!timeout(ctx->last_admin_poll_time,
-		     ctx->vctrl->now, ctx->admin_poll_rate_ms))
+		     ctx->vctrl->now, NVME_MDEV_ADMIN_POLL_MS))
 		return false;
 
 	if (nvme_mdev_vsq_has_data(ctx->vctrl, &ctx->vctrl->vsqs[0]))
@@ -356,8 +355,8 @@ static void nvme_mdev_io_polling_loop(struct io_ctx *ctx)
 	ctx->arb_burst = 1 << ctx->vctrl->arb_burst_shift;
 
 	/* can't stop polling when shadow db not enabled */
-	ctx->idle_timeout_ms = vctrl->mmio.shadow_db_en ? poll_timeout_ms : 0;
-	ctx->admin_poll_rate_ms = admin_poll_rate_ms;
+	ctx->idle_timeout_ms = vctrl->mmio.shadow_db_en ?
+			       READ_ONCE(vctrl->poll_timeout_ms) : 0;
 
 	vctrl->now = ktime_get();
 	ctx->last_admin_poll_time = vctrl->now;
@@ -431,7 +430,8 @@ static void nvme_mdev_io_polling_loop(struct io_ctx *ctx)
 
 		cond_resched();
 
-		if (!timeout(ctx->last_io_t, vctrl->now, io_timeout_ms))
+		if (!timeout(ctx->last_io_t, vctrl->now,
+			     NVME_MDEV_IO_TIMEOUT_MS))
 			continue;
 
 		_WARN(ctx->vctrl, "IO: skipping flush - host IO timeout\n");
