@@ -1,0 +1,67 @@
+What:		/sys/class/nvme_mdev/nvme_mdev/mdev_supported_types/nvme_mdev-V1/
+Date:		November 2026
+Contact:	linux-nvme@lists.infradead.org
+Description:
+		The NVMe mediated device type: a virtual NVMe PCIe controller
+		whose I/O goes through the block layer.  Each instance has
+		its own polling I/O thread.  Writing a UUID to "create" makes
+		a new instance (see sysfs-bus-vfio-mdev); at most 16 instances
+		exist at a time ("available_instances").
+
+What:		/sys/bus/mdev/devices/<uuid>/namespaces/add_namespace
+Date:		November 2026
+Contact:	linux-nvme@lists.infradead.org
+Description:
+		(WO) Writing the path of a host block device (e.g. an NVMe
+		namespace or a partition of one) adds it to the virtual
+		controller as the next free namespace, NSID 1 to 16.  The
+		block device is opened exclusively; it is read-only to the
+		guest if it can only be opened for reading.  The guest is
+		told with a Namespace Attribute Changed event.
+		For example::
+
+		  # echo /dev/nvme0n1p5 > \
+		      /sys/bus/mdev/devices/<uuid>/namespaces/add_namespace
+
+What:		/sys/bus/mdev/devices/<uuid>/namespaces/remove_namespace
+Date:		November 2026
+Contact:	linux-nvme@lists.infradead.org
+Description:
+		(WO) Writing an NSID removes that namespace from the virtual
+		controller and releases the host block device.  This also
+		happens by itself when the host block device goes away.
+
+What:		/sys/bus/mdev/devices/<uuid>/namespaces/namespaces
+Date:		November 2026
+Contact:	linux-nvme@lists.infradead.org
+Description:
+		(RO) One line per namespace of the virtual controller:
+		"VNS<nsid>: <host block device>", followed by " (ro)" for
+		read-only namespaces.
+
+What:		/sys/bus/mdev/devices/<uuid>/settings/iothread_cpu
+Date:		November 2026
+Contact:	linux-nvme@lists.infradead.org
+Description:
+		(RW) The CPU the instance's I/O thread is bound to.  Writing
+		an online CPU number moves the thread there; by default it
+		runs on the CPU the instance was created on.
+
+What:		/sys/bus/mdev/devices/<uuid>/settings/shadow_doorbell
+Date:		November 2026
+Contact:	linux-nvme@lists.infradead.org
+Description:
+		(RW) Whether the virtual controller offers the Doorbell Buffer
+		Config command (shadow doorbells), 1 or 0, 1 by default.
+		Without shadow doorbells the doorbell page is mapped to the
+		guest and the I/O thread polls it continuously.  Can only be
+		changed while the device is not open (-EBUSY otherwise).
+
+What:		/sys/bus/mdev/devices/<uuid>/settings/poll_timeout_ms
+Date:		November 2026
+Contact:	linux-nvme@lists.infradead.org
+Description:
+		(RW) How long, in milliseconds, the I/O thread keeps polling
+		without seeing any I/O before it goes idle and waits for a
+		doorbell write; 0 means it never goes idle.  500 by default,
+		at most 60000.  Only used with shadow doorbells.
