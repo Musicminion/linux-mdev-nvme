@@ -234,8 +234,14 @@ int nvme_mdev_hctrl_hq_submit(struct nvme_mdev_hctrl *hctrl,
 			if (cmd->rw.control & cpu_to_le16(NVME_RW_FUA))
 				opf |= REQ_FUA;
 		}
-		/* completion is reaped with bio_poll() */
-		opf |= REQ_POLLED | REQ_NOWAIT;
+		/*
+		 * Completion is reaped with bio_poll().  No REQ_NOWAIT: while
+		 * the host queue is frozen (e.g. during a controller reset) it
+		 * fails every bio at once, and the guest runs out of retries
+		 * before the reset is over.  Waiting here is fine, nothing
+		 * completes during that time anyway.
+		 */
+		opf |= REQ_POLLED;
 
 		if (WARN_ON(datait->count > BIO_MAX_VECS))
 			return -EINVAL;
