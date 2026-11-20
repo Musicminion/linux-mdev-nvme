@@ -661,8 +661,8 @@ void nvme_mdev_vsq_delete(struct nvme_mdev_vctrl *vctrl, u16 qid);
 bool nvme_mdev_vsq_has_data(struct nvme_mdev_vctrl *vctrl,
 			    struct nvme_vsq *q);
 
-const struct nvme_command *nvme_mdev_vsq_get_cmd(struct nvme_mdev_vctrl *vctrl,
-						 struct nvme_vsq *q);
+bool nvme_mdev_vsq_get_cmd(struct nvme_mdev_vctrl *vctrl, struct nvme_vsq *q,
+			   struct nvme_command *cmd);
 
 void nvme_mdev_vsq_cmd_done_io(struct nvme_mdev_vctrl *vctrl,
 			       u16 sqid, u16 cid, u16 status);

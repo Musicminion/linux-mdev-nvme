@@ -101,10 +101,12 @@ static void nvme_mdev_vsq_advance_head(struct nvme_vsq *q)
 bool nvme_mdev_vsq_has_data(struct nvme_mdev_vctrl *vctrl,
 			    struct nvme_vsq *q)
 {
-	u16 tail = le32_to_cpu(vctrl->mmio.dbs[q->qid].sqt);
+	u16 tail;
 
 	if (!vctrl->mmio.dbs || !vctrl->mmio.eidxs || !q->data)
 		return false;
+
+	tail = le32_to_cpu(vctrl->mmio.dbs[q->qid].sqt);
 
 	if  (tail == q->head)
 		return false;
@@ -114,17 +116,23 @@ bool nvme_mdev_vsq_has_data(struct nvme_mdev_vctrl *vctrl,
 	return true;
 }
 
-/* get one command from a virtual submission queue */
-const struct nvme_command *nvme_mdev_vsq_get_cmd(struct nvme_mdev_vctrl *vctrl,
-						 struct nvme_vsq *q)
+/*
+ * Get one command from a virtual submission queue.  The command is copied
+ * out of guest memory once: validation and use both look at the copy, so
+ * the guest can't change it in between.
+ */
+bool nvme_mdev_vsq_get_cmd(struct nvme_mdev_vctrl *vctrl, struct nvme_vsq *q,
+			   struct nvme_command *cmd)
 {
 	u16 oldhead = q->head;
 	u32 eidx;
 
 	if (!nvme_mdev_vsq_has_data(vctrl, q))
-		return NULL;
+		return false;
 	if (!nvme_mdev_vcq_reserve_space(q->vcq))
-		return NULL;
+		return false;
+
+	memcpy(cmd, &q->data[oldhead], sizeof(*cmd));
 	nvme_mdev_vsq_advance_head(q);
 
 	eidx = q->head + (q->size >> 1);
@@ -132,20 +140,21 @@ const struct nvme_command *nvme_mdev_vsq_get_cmd(struct nvme_mdev_vctrl *vctrl,
 		eidx -= q->size;
 
 	vctrl->mmio.eidxs[q->qid].sqt = cpu_to_le32(eidx);
-
-	return &q->data[oldhead];
+	return true;
 }
 
 bool nvme_mdev_vsq_suspend_io(struct nvme_mdev_vctrl *vctrl, u16 sqid)
 {
 	struct nvme_vsq *q = &vctrl->vsqs[sqid];
-	u16 tail = le32_to_cpu(vctrl->mmio.dbs[q->qid].sqt);
+	u16 tail;
 
 	/* If the queue is not in working state don't allow the idle code
 	 * to kick in
 	 */
 	if (!vctrl->mmio.dbs || !vctrl->mmio.eidxs || !q->data)
 		return false;
+
+	tail = le32_to_cpu(vctrl->mmio.dbs[q->qid].sqt);
 
 	/* queue has data - refuse idle*/
 	if (tail != q->head)

@@ -16,7 +16,8 @@ struct io_ctx {
 	struct nvme_mdev_hctrl *hctrl;
 	struct nvme_mdev_vctrl *vctrl;
 
-	const struct nvme_command *in;
+	const struct nvme_command *in;	/* points to in_cmd */
+	struct nvme_command in_cmd;	/* the command, copied from the guest */
 	struct nvme_mdev_vns *ns;
 	struct nvme_ext_data_iter udatait;
 
@@ -268,9 +269,9 @@ static bool nvme_mdev_io_process_sq(struct io_ctx *ctx, u16 sqid)
 		return false;
 
 	/* read the command */
-	ctx->in = nvme_mdev_vsq_get_cmd(ctx->vctrl, vsq);
-	if (!ctx->in)
+	if (!nvme_mdev_vsq_get_cmd(ctx->vctrl, vsq, &ctx->in_cmd))
 		return false;
+	ctx->in = &ctx->in_cmd;
 	ucid = le16_to_cpu(ctx->in->common.command_id);
 
 	/* translate the command */
