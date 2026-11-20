@@ -44,6 +44,16 @@ enum nvme_async_event {
 #define NVME_SC_PRP_OFFSET_INVALID	NVME_SC_PRP_INVALID_OFFSET
 #define NVME_SC_DNR			NVME_STATUS_DNR
 
+/*
+ * The command id is declared __u16 in struct nvme_common_command (the
+ * host driver never looks at its value), but it is little endian on the
+ * wire like everything else.
+ */
+static inline u16 nvme_mdev_cmd_cid(const struct nvme_command *cmd)
+{
+	return le16_to_cpu((__force __le16)cmd->common.command_id);
+}
+
 /* the 16 dwords of a submission queue entry */
 static inline const u32 *nvme_mdev_cmd_dwords(const struct nvme_command *cmd)
 {

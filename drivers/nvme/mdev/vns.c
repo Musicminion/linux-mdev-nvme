@@ -28,7 +28,7 @@ static void nvme_mdev_vns_send_event(struct nvme_mdev_vctrl *vctrl, u32 ns)
 	if (WARN_ON(ns == 0 || ns > MAX_VIRTUAL_NAMESPACES))
 		return;
 
-	// check if the namespace ID is alredy in the log
+	// check if the namespace ID is already in the log
 	if (log_size == MAX_VIRTUAL_NAMESPACES)
 		return;
 

@@ -14,7 +14,6 @@
 #define CREATE_TRACE_POINTS
 #include "trace.h"
 
-
 struct io_ctx {
 	struct nvme_mdev_hctrl *hctrl;
 	struct nvme_mdev_vctrl *vctrl;
@@ -227,7 +226,6 @@ static int nvme_mdev_io_translate_cmd(struct io_ctx *ctx)
 	if (!ctx->ns->readonly && bdev_read_only(ctx->ns->host_part))
 		ctx->ns->readonly = true;
 
-
 	switch (ctx->in->common.opcode) {
 	case nvme_cmd_flush:
 		return nvme_mdev_io_translate_flush(ctx);
@@ -261,7 +259,7 @@ static bool nvme_mdev_io_process_sq(struct io_ctx *ctx, u16 sqid)
 	if (!nvme_mdev_vsq_get_cmd(ctx->vctrl, vsq, &ctx->in_cmd))
 		return false;
 	ctx->in = &ctx->in_cmd;
-	ucid = le16_to_cpu(ctx->in->common.command_id);
+	ucid = nvme_mdev_cmd_cid(ctx->in);
 
 	/* translate the command */
 	ret = nvme_mdev_io_translate_cmd(ctx);
@@ -326,7 +324,6 @@ static int nvme_mdev_io_process_hwq(struct io_ctx *ctx, u16 hwq)
 
 	return n;
 }
-
 
 /* do polling till one of events stops it */
 static void nvme_mdev_io_polling_loop(struct io_ctx *ctx)

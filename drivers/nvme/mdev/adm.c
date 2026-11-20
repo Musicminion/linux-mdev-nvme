@@ -66,8 +66,8 @@ static int nvme_mdev_adm_handle_id_cntrl(struct adm_ctx *ctx)
 
 	/*Admin Command Set Attributes & Optional Controller Capabilities */
 	// Optional Admin Command Support
-	id->oacs = ctx->vctrl->mmio.shadow_db_supported ?
-			NVME_CTRL_OACS_DBBUF_SUPP : 0;
+	id->oacs = cpu_to_le16(ctx->vctrl->mmio.shadow_db_supported ?
+			       NVME_CTRL_OACS_DBBUF_SUPP : 0);
 	// Abort Command Limit (dummy, zero based)
 	id->acl = 3;
 	 // Asynchronous Event Request Limit (zero based)
@@ -88,9 +88,9 @@ static int nvme_mdev_adm_handle_id_cntrl(struct adm_ctx *ctx)
 	// Autonomous Power State Transition Attributes
 	id->apsta = 0;
 	// Warning Composite Temperature Threshold (dummy)
-	id->wctemp = 0x157;
+	id->wctemp = cpu_to_le16(0x157);
 	// Critical Composite Temperature Threshold (dummy)
-	id->cctemp = 0x175;
+	id->cctemp = cpu_to_le16(0x175);
 	// Maximum Time for Firmware Activation (dummy)
 	id->mtfa = 0;
 	// Host Memory Buffer Preferred Size (dummy)
@@ -128,10 +128,10 @@ static int nvme_mdev_adm_handle_id_cntrl(struct adm_ctx *ctx)
 	// Maximum Outstanding Commands
 	id->maxcmd = 0;
 	// Number of Namespaces
-	id->nn = MAX_VIRTUAL_NAMESPACES;
+	id->nn = cpu_to_le32(MAX_VIRTUAL_NAMESPACES);
 	// Optional NVM Command Support
 	// (we add dsm and write zeros if host supports them)
-	id->oncs = ctx->hctrl->oncs;
+	id->oncs = cpu_to_le16(ctx->hctrl->oncs);
 	// TODOLATER: IO: Fused Operation Support
 	id->fuses = 0;
 	// Format NVM Attributes (don't support)
@@ -149,7 +149,7 @@ static int nvme_mdev_adm_handle_id_cntrl(struct adm_ctx *ctx)
 	// SGL Support
 	id->sgls = 0;
 	// NVM Subsystem NVMe Qualified Name
-	strncpy(id->subnqn, ctx->vctrl->subnqn, sizeof(id->subnqn));
+	strscpy_pad(id->subnqn, ctx->vctrl->subnqn, sizeof(id->subnqn));
 
 	/******************Power state descriptors ***********************/
 	store_le16(&id->psd[0].max_power, 0x9c4); // dummy
@@ -215,7 +215,7 @@ static int nvme_mdev_adm_handle_id_ns(struct adm_ctx *ctx)
 		// Namespace Atomic Boundary Size Power Fail
 		idns->nabspf = 0;
 		// Namespace Optimal IO Boundary
-		idns->noiob = ctx->ns->noiob;
+		idns->noiob = cpu_to_le16(ctx->ns->noiob);
 		// NVM Capacity (another capacity but in bytes)
 		idns->nvmcap[0]  = 0;
 
@@ -280,7 +280,7 @@ static int nvme_mdev_adm_handle_id_active_ns_list(struct adm_ctx *ctx)
 
 	for (nsid = start_nsid + 1; nsid <= MAX_VIRTUAL_NAMESPACES; nsid++)
 		if (nvme_mdev_vns_from_vnsid(vctrl, nsid))
-			nslist[i++] = nsid;
+			nslist[i++] = cpu_to_le32(nsid);
 
 	ret = nvme_mdev_write_to_udata(&ctx->udatait, nslist,
 				       NVME_IDENTIFY_DATA_SIZE);
@@ -614,7 +614,7 @@ static int nvme_mdev_adm_handle_get_features(struct adm_ctx *ctx)
 	unsigned int tmp;
 
 	u32 fid = le32_to_cpu(in->fid);
-	u16 cid = le16_to_cpu(in->command_id);
+	u16 cid = nvme_mdev_cmd_cid(ctx->in);
 
 	_DBG(ctx->vctrl, "ADMINQ: GET_FEATURES FID=0x%x\n", fid);
 
@@ -707,7 +707,7 @@ static int nvme_mdev_adm_handle_set_features(struct adm_ctx *ctx)
 
 	u32 value = le32_to_cpu(in->dword11);
 	u8 fid = le32_to_cpu(in->fid) & 0xFF;
-	u16 cid = le16_to_cpu(in->command_id);
+	u16 cid = nvme_mdev_cmd_cid(ctx->in);
 	u32 nsid = le32_to_cpu(in->nsid);
 
 	_DBG(ctx->vctrl, "ADMINQ: SET_FEATURES cmd. FID=0x%x\n", fid);
@@ -782,7 +782,7 @@ static int nvme_mdev_adm_handle_set_features(struct adm_ctx *ctx)
 /* Response to AER command */
 static int nvme_mdev_adm_handle_async_event(struct adm_ctx *ctx)
 {
-	u16 cid = le16_to_cpu(ctx->in->common.command_id);
+	u16 cid = nvme_mdev_cmd_cid(ctx->in);
 
 	if (!check_reserved_dwords(nvme_mdev_cmd_dwords(ctx->in), 16,
 				   RSRV_NSID | RSRV_DW23 | RSRV_DPTR |
@@ -800,7 +800,7 @@ static int nvme_mdev_adm_handle_async_event(struct adm_ctx *ctx)
  */
 static int nvme_mdev_adm_handle_abort(struct adm_ctx *ctx)
 {
-	u16 cid = le16_to_cpu(ctx->in->common.command_id);
+	u16 cid = nvme_mdev_cmd_cid(ctx->in);
 
 	if (!check_reserved_dwords(nvme_mdev_cmd_dwords(ctx->in), 16,
 				   RSRV_NSID | RSRV_DW23 | RSRV_DPTR |
@@ -880,7 +880,7 @@ void nvme_mdev_adm_process_sq(struct nvme_mdev_vctrl *vctrl)
 			break;
 		ctx.in = &ctx.in_cmd;
 
-		cid = le16_to_cpu(ctx.in->common.command_id);
+		cid = nvme_mdev_cmd_cid(ctx.in);
 		ret = nvme_mdev_adm_handle_cmd(&ctx);
 
 		if (ret == -1)
