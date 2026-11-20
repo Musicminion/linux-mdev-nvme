@@ -247,9 +247,6 @@ static bool nvme_mdev_io_process_sq(struct io_ctx *ctx, u16 sqid)
 	struct nvme_vsq *vsq = &ctx->vctrl->vsqs[sqid];
 	u16 ucid;
 	int ret;
-	unsigned long long c1, c2;
-
-	c1 = nvme_mdev_cycles();
 
 	/* If host queue is full, we can't process a command
 	 * as a command will likely result in passthrough
@@ -289,12 +286,6 @@ static bool nvme_mdev_io_process_sq(struct io_ctx *ctx, u16 sqid)
 
 		nvme_mdev_vsq_cmd_done_io(ctx->vctrl, sqid, ucid, ret);
 	}
-
-	c2 = nvme_mdev_cycles();
-
-	ctx->vctrl->perf.cmds_started++;
-	ctx->vctrl->perf.cycles_send_to_hw += (c2 - c1);
-
 	return true;
 }
 
@@ -309,10 +300,6 @@ static int nvme_mdev_io_process_hwq(struct io_ctx *ctx, u16 hwq)
 {
 	int n, i;
 	struct nvme_ext_cmd_result res[16];
-
-	unsigned long long c1, c2;
-
-	c1 = nvme_mdev_cycles();
 
 	/* process the completions from the hardware */
 	n = nvme_mdev_hctrl_hq_poll(ctx->hctrl, hwq, res, 16);
@@ -330,12 +317,6 @@ static int nvme_mdev_io_process_hwq(struct io_ctx *ctx, u16 hwq)
 			     qid, cid, status);
 
 		nvme_mdev_vsq_cmd_done_io(ctx->vctrl, qid, cid, status);
-	}
-
-	if (n > 0) {
-		c2 = nvme_mdev_cycles();
-		ctx->vctrl->perf.cmds_complete += n;
-		ctx->vctrl->perf.cycles_receive_from_hw += (c2 - c1);
 	}
 
 	return n;

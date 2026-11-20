@@ -257,17 +257,12 @@ void nvme_mdev_irq_cond_trigger(struct nvme_mdev_vctrl *vctrl,
 				unsigned int index)
 {
 	struct nvme_mdev_user_irq *irq = &vctrl->irqs.vecs[index];
-	unsigned long long c1, c2;
 
 	if (irq->irq_pending_cnt == 0)
 		return;
 
 	if (!nvme_mdev_irq_coalesce(vctrl, irq)) {
-		vctrl->perf.interrupts_sent++;
-		c1 = nvme_mdev_cycles();
 		nvme_mdev_irq_trigger(vctrl, index);
-		c2 = nvme_mdev_cycles();
 		nvme_mdev_irq_clear(vctrl, index);
-		vctrl->perf.cycles_irq_delivery += (c2 - c1);
 	}
 }
