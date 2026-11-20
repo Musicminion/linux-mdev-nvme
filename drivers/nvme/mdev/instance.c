@@ -675,9 +675,42 @@ static struct attribute *nvme_mdev_dev_ns_atttributes[] = {
 	NULL
 };
 
+/* idle time (msec) before the I/O thread stops polling, 0: poll forever */
+static ssize_t poll_timeout_ms_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct nvme_mdev_vctrl *vctrl = dev_to_vctrl(dev);
+	unsigned int val;
+	int ret;
+
+	if (!vctrl)
+		return -ENODEV;
+	ret = kstrtouint(buf, 10, &val);
+	if (ret)
+		return ret;
+	if (val > NVME_MDEV_POLL_TIMEOUT_MAX_MS)
+		return -EINVAL;
+	/* taken into account when the I/O thread starts polling again */
+	WRITE_ONCE(vctrl->poll_timeout_ms, val);
+	return count;
+}
+
+static ssize_t poll_timeout_ms_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct nvme_mdev_vctrl *vctrl = dev_to_vctrl(dev);
+
+	if (!vctrl)
+		return -ENODEV;
+	return sysfs_emit(buf, "%u\n", READ_ONCE(vctrl->poll_timeout_ms));
+}
+static DEVICE_ATTR_RW(poll_timeout_ms);
+
 static struct attribute *nvme_mdev_dev_settings_atttributes[] = {
 	&dev_attr_iothread_cpu.attr,
 	&dev_attr_shadow_doorbell.attr,
+	&dev_attr_poll_timeout_ms.attr,
 	NULL
 };
 

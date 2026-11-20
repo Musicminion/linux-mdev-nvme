@@ -51,10 +51,17 @@
 #define MAX_AER_COMMANDS 16
 #define MAX_LOG_PAGES 16
 
-extern bool use_shadow_doorbell;
-extern unsigned int io_timeout_ms;
-extern unsigned int poll_timeout_ms;
-extern unsigned int admin_poll_rate_ms;
+/*
+ * How long to wait for the host I/O to complete when the I/O thread is
+ * paused; longer than the block layer's own timeouts, so that this only
+ * triggers if the host device stopped answering altogether.
+ */
+#define NVME_MDEV_IO_TIMEOUT_MS		60000
+/* admin queue polling period, only without shadow doorbells */
+#define NVME_MDEV_ADMIN_POLL_MS		100
+/* default idle time before the I/O thread stops polling */
+#define NVME_MDEV_POLL_TIMEOUT_MS	500
+#define NVME_MDEV_POLL_TIMEOUT_MAX_MS	60000
 
 /* virtual submission queue*/
 struct  nvme_vsq {
@@ -340,6 +347,7 @@ struct nvme_mdev_vctrl {
 	bool write_atomicity_dn;	/* feature 0x0a, Disable Normal */
 	u8 worload_hint;
 	unsigned int iothread_cpu;
+	unsigned int poll_timeout_ms;	/* 0: never stop polling */
 
 	/* Identification*/
 	char subnqn[256];

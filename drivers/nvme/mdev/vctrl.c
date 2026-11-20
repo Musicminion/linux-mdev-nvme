@@ -105,7 +105,8 @@ int nvme_mdev_vctrl_create(struct nvme_mdev_vctrl *vctrl,
 
 	/* default feature values*/
 	vctrl->arb_burst_shift = 3;
-	vctrl->mmio.shadow_db_supported = use_shadow_doorbell;
+	vctrl->mmio.shadow_db_supported = true;
+	vctrl->poll_timeout_ms = NVME_MDEV_POLL_TIMEOUT_MS;
 
 	ret = nvme_mdev_pci_create(vctrl);
 	if (ret)
