@@ -85,7 +85,7 @@ static void nvme_mdev_mmio_db_write_sq(struct nvme_mdev_vctrl *vctrl,
 		vctrl->mmio.dbs[qid].sqt = cpu_to_le32(val & 0x0000FFFF);
 
 	if (qid != 0)
-		vctrl->io_idle = false;
+		WRITE_ONCE(vctrl->io_idle, false);
 
 	if (vctrl->vctrl_paused || !vctrl->mmio.shadow_db_supported)
 		return;

@@ -470,9 +470,9 @@ static void nvme_mdev_io_polling_loop(struct io_ctx *ctx)
 			}
 
 		if (idle) {
-			_DBG(ctx->vctrl, "IO: self-parking\n");
-			vctrl->io_idle = true;
-			nvme_mdev_io_pause(vctrl);
+			/* sleep in nvme_mdev_io_polling_thread() until kicked */
+			_DBG(ctx->vctrl, "IO: going idle\n");
+			WRITE_ONCE(vctrl->io_idle, true);
 		}
 
 		mutex_unlock(&vctrl->lock);
@@ -513,6 +513,18 @@ static int nvme_mdev_io_polling_thread(void *data)
 		if (kthread_should_stop())
 			break;
 
+		/*
+		 * Idle: sleep until a doorbell write kicks us (or we are parked
+		 * or stopped).  io_idle is only cleared under vctrl->lock.
+		 */
+		set_current_state(TASK_INTERRUPTIBLE);
+		if (READ_ONCE(ctx.vctrl->io_idle) && !kthread_should_park() &&
+		    !kthread_should_stop()) {
+			schedule();
+			continue;
+		}
+		__set_current_state(TASK_RUNNING);
+
 		nvme_mdev_io_polling_loop(&ctx);
 	}
 
@@ -520,27 +532,39 @@ static int nvme_mdev_io_polling_thread(void *data)
 	return 0;
 }
 
-/* Kick the IO thread into running state*/
+/*
+ * Undo nvme_mdev_io_pause(), and wake the thread up if it has work (it
+ * goes back to sleep by itself if io_idle is still set).
+ *
+ * Only ever park/unpark the thread from other threads: kthread_park()
+ * on itself leaves the "parked" completion signalled, and a later
+ * kthread_park() from another thread then returns before the thread
+ * actually parked (2019 parked itself when idle).  The I/O thread runs
+ * nothing else while it is in here anyway.
+ */
 void nvme_mdev_io_resume(struct nvme_mdev_vctrl *vctrl)
 {
 	lockdep_assert_held(&vctrl->lock);
 
-	if (!vctrl->iothread || !vctrl->iothread_parked)
-		return;
-	if (vctrl->io_idle || vctrl->vctrl_paused)
+	if (!vctrl->iothread || current == vctrl->iothread ||
+	    vctrl->vctrl_paused)
 		return;
 
-	vctrl->iothread_parked = false;
-	/* has memory barrier*/
-	kthread_unpark(vctrl->iothread);
+	if (vctrl->iothread_parked) {
+		vctrl->iothread_parked = false;
+		kthread_unpark(vctrl->iothread);
+	}
+	if (!READ_ONCE(vctrl->io_idle))
+		wake_up_process(vctrl->iothread);
 }
 
-/* Pause the IO thread */
+/* Pause the IO thread (waits until it is parked) */
 void nvme_mdev_io_pause(struct nvme_mdev_vctrl *vctrl)
 {
 	lockdep_assert_held(&vctrl->lock);
 
-	if (!vctrl->iothread || vctrl->iothread_parked)
+	if (!vctrl->iothread || current == vctrl->iothread ||
+	    vctrl->iothread_parked)
 		return;
 
 	vctrl->iothread_parked = true;
@@ -562,7 +586,7 @@ int nvme_mdev_io_create(struct nvme_mdev_vctrl *vctrl, unsigned int cpu)
 
 	vctrl->iothread_cpu = cpu;
 	vctrl->iothread_parked = false;
-	vctrl->io_idle = true;
+	WRITE_ONCE(vctrl->io_idle, true);
 
 	vctrl->iothread = kthread_create_on_node(nvme_mdev_io_polling_thread,
 						 vctrl,
@@ -576,13 +600,7 @@ int nvme_mdev_io_create(struct nvme_mdev_vctrl *vctrl, unsigned int cpu)
 	}
 
 	kthread_bind(vctrl->iothread, cpu);
-
-	if (vctrl->io_idle) {
-		vctrl->iothread_parked = true;
-		kthread_park(vctrl->iothread);
-		return 0;
-	}
-
+	/* it goes to sleep right away: io_idle is set */
 	wake_up_process(vctrl->iothread);
 	return 0;
 }
@@ -603,8 +621,13 @@ void nvme_mdev_io_free(struct nvme_mdev_vctrl *vctrl)
 	vctrl->iothread = NULL;
 }
 
+/*
+ * The I/O thread must not be working: parked, or idle (it doesn't touch
+ * anything while io_idle is set, and that is only cleared under the lock).
+ */
 void nvme_mdev_assert_io_not_running(struct nvme_mdev_vctrl *vctrl)
 {
-	if (WARN_ON(vctrl->iothread && !vctrl->iothread_parked))
+	if (WARN_ON(vctrl->iothread && current != vctrl->iothread &&
+		    !vctrl->iothread_parked && !READ_ONCE(vctrl->io_idle)))
 		nvme_mdev_io_pause(vctrl);
 }

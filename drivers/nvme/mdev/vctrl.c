@@ -232,7 +232,7 @@ void nvme_mdev_vctrl_host_restart(struct nvme_mdev_vctrl *vctrl)
 		nvme_mdev_hctrl_hq_mark_lost(vctrl->hctrl, hq->hqid);
 	/* the I/O thread has to run to deliver the aborts */
 	if (!list_empty(&vctrl->host_hw_queues))
-		vctrl->io_idle = false;
+		WRITE_ONCE(vctrl->io_idle, false);
 	mutex_unlock(&vctrl->lock);
 }
 
@@ -347,7 +347,7 @@ bool nvme_mdev_vctrl_enable(struct nvme_mdev_vctrl *vctrl,
 
 	if (!vctrl->mmio.shadow_db_supported) {
 		/* start polling right away to support admin queue */
-		vctrl->io_idle = false;
+		WRITE_ONCE(vctrl->io_idle, false);
 		nvme_mdev_io_resume(vctrl);
 	}
 
@@ -384,7 +384,7 @@ void nvme_mdev_vctrl_disable(struct nvme_mdev_vctrl *vctrl)
 	nvme_mdev_vcq_delete(vctrl, 0);
 
 	nvme_mdev_mmio_disable_dbs(vctrl);
-	vctrl->io_idle = true;
+	WRITE_ONCE(vctrl->io_idle, true);
 }
 
 /* External reset */
