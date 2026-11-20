@@ -11,7 +11,8 @@
 struct adm_ctx {
 	struct nvme_mdev_vctrl *vctrl;
 	struct nvme_mdev_hctrl *hctrl;
-	const struct nvme_command *in;
+	const struct nvme_command *in;	/* points to in_cmd */
+	struct nvme_command in_cmd;	/* the command, copied from the guest */
 	struct nvme_mdev_vns *ns;
 	struct nvme_ext_data_iter udatait;
 	unsigned int datalen;
@@ -875,9 +876,9 @@ void nvme_mdev_adm_process_sq(struct nvme_mdev_vctrl *vctrl)
 		int ret;
 		u16 cid;
 
-		ctx.in = nvme_mdev_vsq_get_cmd(vctrl, &vctrl->vsqs[0]);
-		if (!ctx.in)
+		if (!nvme_mdev_vsq_get_cmd(vctrl, &vctrl->vsqs[0], &ctx.in_cmd))
 			break;
+		ctx.in = &ctx.in_cmd;
 
 		cid = le16_to_cpu(ctx.in->common.command_id);
 		ret = nvme_mdev_adm_handle_cmd(&ctx);

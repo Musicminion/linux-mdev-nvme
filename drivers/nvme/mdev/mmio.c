@@ -82,7 +82,8 @@ static void nvme_mdev_mmio_db_write_sq(struct nvme_mdev_vctrl *vctrl,
 
 	/* emulate the shadow doorbell functionality */
 	if (!vctrl->mmio.shadow_db_en || qid == 0)
-		vctrl->mmio.dbs[qid].sqt = cpu_to_le32(val & 0x0000FFFF);
+		WRITE_ONCE(vctrl->mmio.dbs[qid].sqt,
+			   cpu_to_le32(val & 0x0000FFFF));
 
 	if (qid != 0)
 		WRITE_ONCE(vctrl->io_idle, false);
@@ -113,7 +114,7 @@ static void nvme_mdev_mmio_db_write_cq(struct nvme_mdev_vctrl *vctrl,
 
 	/* emulate the shadow doorbell functionality */
 	if (!vctrl->mmio.shadow_db_en || qid == 0)
-		vctrl->mmio.dbs[qid].cqh = cpu_to_le16(val & 0xFFFF);
+		WRITE_ONCE(vctrl->mmio.dbs[qid].cqh, cpu_to_le32(val & 0xFFFF));
 
 	if (vctrl->vctrl_paused || !vctrl->mmio.shadow_db_supported)
 		return;
@@ -507,8 +508,8 @@ int nvme_mdev_mmio_enable_dbs(struct nvme_mdev_vctrl *vctrl)
 	/* setup normal doorbells and reset them*/
 	vctrl->mmio.dbs = vctrl->mmio.db_page_kmap;
 	vctrl->mmio.eidxs = vctrl->mmio.fake_eidx_kmap;
-	memset((void *)vctrl->mmio.dbs, 0, DB_AREA_SIZE);
-	memset((void *)vctrl->mmio.eidxs, 0, DB_AREA_SIZE);
+	memset(vctrl->mmio.dbs, 0, DB_AREA_SIZE);
+	memset(vctrl->mmio.eidxs, 0, DB_AREA_SIZE);
 	return 0;
 }
 
@@ -537,11 +538,8 @@ int nvme_mdev_mmio_enable_dbs_shadow(struct nvme_mdev_vctrl *vctrl,
 	vctrl->mmio.dbs = vctrl->mmio.sdb_map.kmap;
 	vctrl->mmio.eidxs = vctrl->mmio.seidx_map.kmap;
 
-	memcpy((void *)vctrl->mmio.dbs,
-	       vctrl->mmio.db_page_kmap, DB_AREA_SIZE);
-
-	memcpy((void *)vctrl->mmio.eidxs,
-	       vctrl->mmio.db_page_kmap, DB_AREA_SIZE);
+	memcpy(vctrl->mmio.dbs, vctrl->mmio.db_page_kmap, DB_AREA_SIZE);
+	memcpy(vctrl->mmio.eidxs, vctrl->mmio.db_page_kmap, DB_AREA_SIZE);
 
 	vctrl->mmio.shadow_db_en = true;
 	return 0;
