@@ -236,7 +236,6 @@ int nvme_mdev_vctrl_open(struct nvme_mdev_vctrl *vctrl)
 	nvme_mdev_mmio_open(vctrl);
 	vctrl->inuse = true;
 
-	memset(&vctrl->perf, 0, sizeof(vctrl->perf));
 
 out:
 	mutex_unlock(&vctrl->lock);

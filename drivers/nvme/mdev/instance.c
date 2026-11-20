@@ -714,66 +714,6 @@ static struct attribute *nvme_mdev_dev_settings_atttributes[] = {
 	NULL
 };
 
-/* show perf stats */
-static ssize_t stats_show(struct device *dev,
-			  struct device_attribute *attr, char *buf)
-{
-	struct nvme_mdev_vctrl *vctrl = dev_to_vctrl(dev);
-	struct nvme_mdev_perf *perf;
-
-	if (!vctrl)
-		return -ENODEV;
-
-	perf = &vctrl->perf;
-
-	return sysfs_emit(buf,
-		"%u %llu %llu %llu %llu %llu %llu\n",
-
-#ifdef CONFIG_X86
-		tsc_khz,
-#else
-		0,
-#endif
-
-		perf->cmds_started,
-		perf->cycles_send_to_hw,
-
-		perf->cmds_complete,
-		perf->cycles_receive_from_hw,
-
-		perf->interrupts_sent,
-		perf->cycles_irq_delivery);
-}
-
-/* clear the perf stats */
-static ssize_t stats_store(struct device *dev,
-			   struct device_attribute *attr,
-			   const char *buf, size_t count)
-{
-	bool val;
-	int ret;
-	struct nvme_mdev_vctrl *vctrl = dev_to_vctrl(dev);
-
-	if (!vctrl)
-		return -ENODEV;
-	ret = kstrtobool(buf, &val);
-	if (ret)
-		return ret;
-
-	if (!val)
-		return -EINVAL;
-
-	memset(&vctrl->perf, 0, sizeof(vctrl->perf));
-	return count;
-}
-
-static DEVICE_ATTR_RW(stats);
-
-static struct attribute *nvme_mdev_dev_debug_attributes[] = {
-	&dev_attr_stats.attr,
-	NULL
-};
-
 static const struct attribute_group nvme_mdev_ns_attr_group = {
 	.name = "namespaces",
 	.attrs = nvme_mdev_dev_ns_atttributes,
@@ -784,15 +724,9 @@ static const struct attribute_group nvme_mdev_setting_attr_group = {
 	.attrs = nvme_mdev_dev_settings_atttributes,
 };
 
-static const struct attribute_group nvme_mdev_debug_attr_group = {
-	.name = "debug",
-	.attrs = nvme_mdev_dev_debug_attributes,
-};
-
 static const struct attribute_group *nvme_mdev_dev_attributte_groups[] = {
 	&nvme_mdev_ns_attr_group,
 	&nvme_mdev_setting_attr_group,
-	&nvme_mdev_debug_attr_group,
 	NULL,
 };
 

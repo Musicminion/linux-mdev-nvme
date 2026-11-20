@@ -18,7 +18,6 @@
 #include <linux/bio.h>
 #include <linux/eventfd.h>
 #include <linux/workqueue.h>
-#include <linux/timex.h>
 #include <linux/dmapool.h>
 #include <linux/byteorder/generic.h>
 #include "spec.h"
@@ -283,17 +282,6 @@ struct nvme_mdev_io_region {
 	unsigned int mmap_area_size;
 };
 
-struct nvme_mdev_perf {
-	/* number of IO commands received */
-	unsigned long long cmds_started;
-	unsigned long long cmds_complete;
-	unsigned long long interrupts_sent;
-
-	unsigned long long cycles_send_to_hw;
-	unsigned long long cycles_receive_from_hw;
-	unsigned long long cycles_irq_delivery;
-};
-
 /*Virtual NVME controller state */
 struct nvme_mdev_vctrl {
 	struct vfio_device vdev;	/* must be first, see vfio_alloc_device */
@@ -355,7 +343,6 @@ struct nvme_mdev_vctrl {
 
 	bool vctrl_paused; /* true when the host device paused our IO */
 
-	struct nvme_mdev_perf perf;
 };
 
 /* mdev instance type*/
@@ -800,12 +787,6 @@ static inline int nvme_mdev_translate_error_block(blk_status_t blk_sts)
 static inline bool timeout(ktime_t event, ktime_t now, unsigned long timeout_ms)
 {
 	return ktime_ms_delta(now, event) > (long)timeout_ms;
-}
-
-/* cheap cycle counter for the inline performance statistics */
-static inline u64 nvme_mdev_cycles(void)
-{
-	return get_cycles();
 }
 
 #endif // _MDEV_NVME_H
