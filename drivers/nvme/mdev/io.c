@@ -11,6 +11,9 @@
 #include <linux/ktime.h>
 #include "priv.h"
 
+#define CREATE_TRACE_POINTS
+#include "trace.h"
+
 
 struct io_ctx {
 	struct nvme_mdev_hctrl *hctrl;
@@ -271,6 +274,7 @@ static bool nvme_mdev_io_process_sq(struct io_ctx *ctx, u16 sqid)
 	}
 
 	/*passthrough*/
+	trace_nvme_mdev_io_submit(ctx->vctrl, sqid, ctx->in);
 	ret = nvme_mdev_hctrl_hq_submit(ctx->hctrl,
 					ctx->ns,
 					vsq->hsq,
@@ -316,6 +320,7 @@ static int nvme_mdev_io_process_hwq(struct io_ctx *ctx, u16 hwq)
 			     "IOQ: QID %d CID %d FAILED: status 0x%x (host response)\n",
 			     qid, cid, status);
 
+		trace_nvme_mdev_io_complete(ctx->vctrl, qid, cid, status);
 		nvme_mdev_vsq_cmd_done_io(ctx->vctrl, qid, cid, status);
 	}
 

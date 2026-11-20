@@ -9,6 +9,7 @@
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include "priv.h"
+#include "trace.h"
 
 /* Setup the interrupt subsystem */
 void nvme_mdev_irqs_setup(struct nvme_mdev_vctrl *vctrl)
@@ -248,8 +249,10 @@ void nvme_mdev_irq_trigger(struct nvme_mdev_vctrl *vctrl,
 {
 	struct nvme_mdev_user_irq *irq = &vctrl->irqs.vecs[index];
 
-	if (irq->trigger)
+	if (irq->trigger) {
+		trace_nvme_mdev_irq(vctrl, index);
 		eventfd_signal(irq->trigger);
+	}
 }
 
 /* Trigger previously raised interrupt */
