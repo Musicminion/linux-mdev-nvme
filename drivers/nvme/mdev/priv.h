@@ -80,7 +80,8 @@ struct nvme_vcq {
 	u16 tail;
 	bool phase; /* current queue phase */
 
-	volatile struct nvme_completion *data;
+	/* in guest memory: written with WRITE_ONCE(), see vcq.c */
+	struct nvme_completion *data;
 
 	/* number of items pending*/
 	u16 pending;
@@ -151,10 +152,15 @@ struct nvme_mdev_viommu {
 	dma_addr_t unmap_end;
 };
 
+/*
+ * Doorbells and event indexes live in memory shared with the guest (the
+ * shadow doorbell buffers, or our page the doorbell writes land in): all
+ * accesses are READ_ONCE()/WRITE_ONCE() or acquire loads, see vsq.c/vcq.c.
+ */
 struct doorbell {
-	volatile __le32 sqt;
+	__le32 sqt;
 	u8 rsvd1[(4 << DB_STRIDE_SHIFT) - sizeof(__le32)];
-	volatile __le32 cqh;
+	__le32 cqh;
 	u8 rsvd2[(4 << DB_STRIDE_SHIFT) - sizeof(__le32)];
 };
 
@@ -185,8 +191,8 @@ struct nvme_mdev_user_ctrl_mmio {
 	struct page_map seidx_map;
 
 	/* Current doorbell mappings */
-	volatile struct doorbell *dbs;
-	volatile struct doorbell *eidxs;
+	struct doorbell *dbs;
+	struct doorbell *eidxs;
 };
 
 /* pci configuration space of the device*/
@@ -602,8 +608,8 @@ void nvme_mdev_vsq_delete(struct nvme_mdev_vctrl *vctrl, u16 qid);
 bool nvme_mdev_vsq_has_data(struct nvme_mdev_vctrl *vctrl,
 			    struct nvme_vsq *q);
 
-const struct nvme_command *nvme_mdev_vsq_get_cmd(struct nvme_mdev_vctrl *vctrl,
-						 struct nvme_vsq *q);
+bool nvme_mdev_vsq_get_cmd(struct nvme_mdev_vctrl *vctrl, struct nvme_vsq *q,
+			   struct nvme_command *cmd);
 
 void nvme_mdev_vsq_cmd_done_io(struct nvme_mdev_vctrl *vctrl,
 			       u16 sqid, u16 cid, u16 status);

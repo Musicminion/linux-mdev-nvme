@@ -46,8 +46,8 @@ int nvme_mdev_vsq_init(struct nvme_mdev_vctrl *vctrl,
 
 	set_bit(qid, vctrl->vsq_en);
 
-	vctrl->mmio.dbs[q->qid].sqt = 0;
-	vctrl->mmio.eidxs[q->qid].sqt = 0;
+	WRITE_ONCE(vctrl->mmio.dbs[q->qid].sqt, 0);
+	WRITE_ONCE(vctrl->mmio.eidxs[q->qid].sqt, 0);
 
 	return 0;
 }
@@ -59,7 +59,7 @@ int nvme_mdev_vsq_viommu_update(struct nvme_mdev_viommu *viommu,
 	void *data;
 
 	if (q->data)
-		vunmap((void *)q->data);
+		vunmap(q->data);
 
 	data = nvme_mdev_udata_queue_vmap(viommu, q->iova,
 					  (unsigned int)q->size *
@@ -101,10 +101,18 @@ static void nvme_mdev_vsq_advance_head(struct nvme_vsq *q)
 bool nvme_mdev_vsq_has_data(struct nvme_mdev_vctrl *vctrl,
 			    struct nvme_vsq *q)
 {
-	u16 tail = le32_to_cpu(vctrl->mmio.dbs[q->qid].sqt);
+	u16 tail;
 
+	/* (2019 read the doorbell before checking it exists) */
 	if (!vctrl->mmio.dbs || !vctrl->mmio.eidxs || !q->data)
 		return false;
+
+	/*
+	 * Acquire: the command reads that follow must not be done before the
+	 * tail read.  Pairs with the guest's write barrier between filling
+	 * the entry and writing the (shadow) doorbell.
+	 */
+	tail = le32_to_cpu(smp_load_acquire(&vctrl->mmio.dbs[q->qid].sqt));
 
 	if  (tail == q->head)
 		return false;
@@ -114,32 +122,37 @@ bool nvme_mdev_vsq_has_data(struct nvme_mdev_vctrl *vctrl,
 	return true;
 }
 
-/* get one command from a virtual submission queue */
-const struct nvme_command *nvme_mdev_vsq_get_cmd(struct nvme_mdev_vctrl *vctrl,
-						 struct nvme_vsq *q)
+/*
+ * Get one command from a virtual submission queue.  The command is copied
+ * out of guest memory once: everything after this (validation, then use)
+ * looks at the copy, so the guest can't change it in between.
+ */
+bool nvme_mdev_vsq_get_cmd(struct nvme_mdev_vctrl *vctrl, struct nvme_vsq *q,
+			   struct nvme_command *cmd)
 {
 	u16 oldhead = q->head;
 	u32 eidx;
 
 	if (!nvme_mdev_vsq_has_data(vctrl, q))
-		return NULL;
+		return false;
 	if (!nvme_mdev_vcq_reserve_space(q->vcq))
-		return NULL;
+		return false;
+
+	memcpy(cmd, &q->data[oldhead], sizeof(*cmd));
 	nvme_mdev_vsq_advance_head(q);
 
 	eidx = q->head + (q->size >> 1);
 	if (eidx >= q->size)
 		eidx -= q->size;
 
-	vctrl->mmio.eidxs[q->qid].sqt = cpu_to_le32(eidx);
-
-	return &q->data[oldhead];
+	WRITE_ONCE(vctrl->mmio.eidxs[q->qid].sqt, cpu_to_le32(eidx));
+	return true;
 }
 
 bool nvme_mdev_vsq_suspend_io(struct nvme_mdev_vctrl *vctrl, u16 sqid)
 {
 	struct nvme_vsq *q = &vctrl->vsqs[sqid];
-	u16 tail = le32_to_cpu(vctrl->mmio.dbs[q->qid].sqt);
+	u16 tail;
 
 	/* If the queue is not in working state don't allow the idle code
 	 * to kick in
@@ -147,18 +160,26 @@ bool nvme_mdev_vsq_suspend_io(struct nvme_mdev_vctrl *vctrl, u16 sqid)
 	if (!vctrl->mmio.dbs || !vctrl->mmio.eidxs || !q->data)
 		return false;
 
+	tail = le32_to_cpu(READ_ONCE(vctrl->mmio.dbs[q->qid].sqt));
+
 	/* queue has data - refuse idle*/
 	if (tail != q->head)
 		return false;
 
 	/* Write eventid to tell the user to ring normal doorbell*/
-	vctrl->mmio.eidxs[q->qid].sqt = cpu_to_le32(q->head);
+	WRITE_ONCE(vctrl->mmio.eidxs[q->qid].sqt, cpu_to_le32(q->head));
 
-	/* memory barrier to ensure that the user have seen the eidx */
-	mb();
+	/*
+	 * Store/load ordering: the event index must be visible before we
+	 * look at the doorbell again.  Pairs with the full barrier the
+	 * guest has between writing the shadow doorbell and reading the
+	 * event index (see nvme_dbbuf_update_and_check_event()); one of
+	 * the two sides sees the other's write.
+	 */
+	smp_mb();
 
 	/* Check that doorbell diddn't move meanwhile */
-	tail = le32_to_cpu(vctrl->mmio.dbs[q->qid].sqt);
+	tail = le32_to_cpu(READ_ONCE(vctrl->mmio.dbs[q->qid].sqt));
 	return (tail == q->head);
 }
 

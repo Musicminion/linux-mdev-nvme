@@ -38,8 +38,8 @@ int nvme_mdev_vcq_init(struct nvme_mdev_vctrl *vctrl, u16 qid,
 
 	set_bit(qid, vctrl->vcq_en);
 
-	vctrl->mmio.dbs[q->qid].cqh = 0;
-	vctrl->mmio.eidxs[q->qid].cqh = 0;
+	WRITE_ONCE(vctrl->mmio.dbs[q->qid].cqh, 0);
+	WRITE_ONCE(vctrl->mmio.eidxs[q->qid].cqh, 0);
 	return 0;
 }
 
@@ -50,7 +50,7 @@ int nvme_mdev_vcq_viommu_update(struct nvme_mdev_viommu *viommu,
 	void *data;
 
 	if (q->data)
-		vunmap((void *)q->data);
+		vunmap(q->data);
 
 	data = nvme_mdev_udata_queue_vmap(viommu, q->iova,
 					  (unsigned int)q->size *
@@ -69,7 +69,7 @@ void nvme_mdev_vcq_delete(struct nvme_mdev_vctrl *vctrl, u16 qid)
 	lockdep_assert_held(&vctrl->lock);
 
 	if (q->data)
-		vunmap((void *)q->data);
+		vunmap(q->data);
 	q->data = NULL;
 
 	_DBG(vctrl, "VCQ: delete qid=%d\n", q->qid);
@@ -104,7 +104,11 @@ void nvme_mdev_vcq_process(struct nvme_mdev_vctrl *vctrl, u16 qid,
 	if (!vctrl->mmio.dbs || !vctrl->mmio.eidxs)
 		return;
 
-	new_head = le32_to_cpu(vctrl->mmio.dbs[qid].cqh);
+	/*
+	 * Acquire: the entries the guest just released get overwritten by
+	 * later completions, those stores must come after this load.
+	 */
+	new_head = le32_to_cpu(smp_load_acquire(&vctrl->mmio.dbs[qid].cqh));
 
 	if (new_head != q->head) {
 		/* bad tail - can't process*/
@@ -121,7 +125,7 @@ void nvme_mdev_vcq_process(struct nvme_mdev_vctrl *vctrl, u16 qid,
 		eidx = q->head + (q->size >> 1);
 		if (eidx >= q->size)
 			eidx -= q->size;
-		vctrl->mmio.eidxs[q->qid].cqh = cpu_to_le32(eidx);
+		WRITE_ONCE(vctrl->mmio.eidxs[q->qid].cqh, cpu_to_le32(eidx));
 	}
 
 	if (q->irq != -1 && trigger_irqs) {
@@ -136,7 +140,7 @@ void nvme_mdev_vcq_process(struct nvme_mdev_vctrl *vctrl, u16 qid,
 bool nvme_mdev_vcq_flush(struct nvme_mdev_vctrl *vctrl, u16 qid)
 {
 	struct nvme_vcq *q = &vctrl->vcqs[qid];
-	u16 new_head = le32_to_cpu(vctrl->mmio.dbs[qid].cqh);
+	u16 new_head = le32_to_cpu(READ_ONCE(vctrl->mmio.dbs[qid].cqh));
 
 	if (new_head == q->tail || q->irq == -1)
 		return false;
@@ -170,7 +174,7 @@ void nvme_mdev_vcq_write_io(struct nvme_mdev_vctrl *vctrl,
 			    struct nvme_vcq *q, u16 sq_head,
 			    u16 sqid, u16 cid, u16 status)
 {
-	volatile u64 *qw = (__le64 *)(&q->data[q->tail]);
+	__le64 *qw = (__le64 *)(&q->data[q->tail]);
 
 	u64 phase = q->phase ? (0x1ULL << 48) : 0;
 	u64 qw1 =
@@ -179,6 +183,12 @@ void nvme_mdev_vcq_write_io(struct nvme_mdev_vctrl *vctrl,
 		((u64)cid << 32) |
 		((u64)status << 49) | phase;
 
+	/*
+	 * Only the second qword is written: status and phase are in it, so a
+	 * single store publishes the entry.  The data the device wrote for
+	 * the command was ordered before this by the acquire load of the
+	 * request status in the I/O backend.
+	 */
 	WRITE_ONCE(qw[1], cpu_to_le64(qw1));
 
 	nvme_mdev_vcq_advance_tail(q);
@@ -191,7 +201,7 @@ void nvme_mdev_vcq_write_adm(struct nvme_mdev_vctrl *vctrl,
 			     struct nvme_vcq *q, u32 dw0,
 			     u16 sq_head, u16 cid, u16 status)
 {
-	volatile u64 *qw = (__le64 *)(&q->data[q->tail]);
+	__le64 *qw = (__le64 *)(&q->data[q->tail]);
 
 	u64 phase = q->phase ? (0x1ULL << 48) : 0;
 	u64 qw1 =
@@ -200,8 +210,11 @@ void nvme_mdev_vcq_write_adm(struct nvme_mdev_vctrl *vctrl,
 		((u64)status << 49) | phase;
 
 	WRITE_ONCE(qw[0], cpu_to_le64(dw0));
-	/* ensure that hardware sees the phase bit flip last */
-	wmb();
+	/*
+	 * The guest (a CPU, not a device) must see DW0 and any data we
+	 * copied into its buffers before the phase bit flips.
+	 */
+	smp_wmb();
 	WRITE_ONCE(qw[1], cpu_to_le64(qw1));
 
 	nvme_mdev_vcq_advance_tail(q);
