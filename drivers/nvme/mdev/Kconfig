@@ -10,7 +10,7 @@ config NVME_MDEV_VFIO
 	  controller, using a VFIO mediated device.  The guest uses its own,
 	  unmodified NVMe driver; a polling thread, which belongs to the
 	  process using the device (QEMU), translates the I/O commands and
-	  sends them through the block layer as polled bios (configure poll
-	  queues on the host device, e.g. nvme.poll_queues).
+	  sends them through the block layer, as polled bios to devices that
+	  can poll (configure poll queues on NVMe devices, nvme.poll_queues).
 
 	  If unsure, say N.
