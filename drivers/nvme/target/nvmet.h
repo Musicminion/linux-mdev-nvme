@@ -443,6 +443,10 @@ struct nvmet_fabrics_ops {
 			   void *feat_data);
 	u16 (*get_feature)(const struct nvmet_ctrl *ctrl, u8 feat,
 			   void *feat_data);
+
+	/* Optional for PCI target controllers: Doorbell Buffer Config */
+	u16 (*dbbuf_config)(struct nvmet_ctrl *ctrl, u64 dbbuf_addr,
+			    u64 eventidx_addr);
 };
 
 #define NVMET_MAX_INLINE_BIOVEC	8

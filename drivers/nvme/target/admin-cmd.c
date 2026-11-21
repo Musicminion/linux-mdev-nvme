@@ -107,6 +107,46 @@ complete:
 	nvmet_req_complete(req, status);
 }
 
+static bool nvmet_dbbuf_supported(struct nvmet_ctrl *ctrl)
+{
+	return nvmet_is_pci_ctrl(ctrl) && ctrl->ops->dbbuf_config;
+}
+
+/*
+ * Doorbell Buffer Config: tell the controller where the host keeps its
+ * shadow doorbells and event indexes.  This is for emulated controllers
+ * (a VM's doorbell writes are expensive), so it only exists for PCI
+ * target controllers whose transport implements it.
+ */
+static void nvmet_execute_dbbuf(struct nvmet_req *req)
+{
+	struct nvmet_ctrl *ctrl = req->sq->ctrl;
+	u64 dbbuf_addr = le64_to_cpu(req->cmd->dbbuf.prp1);
+	u64 eventidx_addr = le64_to_cpu(req->cmd->dbbuf.prp2);
+	u64 page_mask = (1ULL << (nvmet_cc_mps(ctrl->cc) + 12)) - 1;
+	u16 status;
+
+	if (!nvmet_check_transfer_len(req, 0))
+		return;
+
+	if (!nvmet_dbbuf_supported(ctrl)) {
+		status = nvmet_report_invalid_opcode(req);
+		goto complete;
+	}
+
+	/* both buffers are one memory page, page aligned */
+	if ((dbbuf_addr | eventidx_addr) & page_mask) {
+		req->error_loc = offsetof(struct nvme_dbbuf, prp1);
+		status = NVME_SC_INVALID_FIELD | NVME_STATUS_DNR;
+		goto complete;
+	}
+
+	status = ctrl->ops->dbbuf_config(ctrl, dbbuf_addr, eventidx_addr);
+
+complete:
+	nvmet_req_complete(req, status);
+}
+
 static void nvmet_execute_create_cq(struct nvmet_req *req)
 {
 	struct nvmet_ctrl *ctrl = req->sq->ctrl;
@@ -369,6 +409,9 @@ static void nvmet_get_cmd_effects_admin(struct nvmet_ctrl *ctrl,
 		log->acs[nvme_admin_delete_cq] =
 		log->acs[nvme_admin_create_cq] =
 			cpu_to_le32(NVME_CMD_EFFECTS_CSUPP);
+		if (nvmet_dbbuf_supported(ctrl))
+			log->acs[nvme_admin_dbbuf] =
+				cpu_to_le32(NVME_CMD_EFFECTS_CSUPP);
 	}
 
 	log->acs[nvme_admin_get_log_page] =
@@ -716,6 +759,8 @@ static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
 	id->ctratt = cpu_to_le32(ctratt);
 
 	id->oacs = 0;
+	if (nvmet_dbbuf_supported(ctrl))
+		id->oacs |= cpu_to_le16(NVME_CTRL_OACS_DBBUF_SUPP);
 
 	/*
 	 * We don't really have a practical limit on the number of abort
@@ -1683,6 +1728,9 @@ u16 nvmet_parse_admin_cmd(struct nvmet_req *req)
 		return 0;
 	case nvme_admin_create_cq:
 		req->execute = nvmet_execute_create_cq;
+		return 0;
+	case nvme_admin_dbbuf:
+		req->execute = nvmet_execute_dbbuf;
 		return 0;
 	case nvme_admin_identify:
 		req->execute = nvmet_execute_identify;
