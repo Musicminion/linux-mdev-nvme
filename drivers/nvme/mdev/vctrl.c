@@ -26,27 +26,6 @@ static void nvme_mdev_vctrl_init_id(struct nvme_mdev_vctrl *vctrl)
 	snprintf(vctrl->serial, sizeof(vctrl->serial), "%pUl", guid->b);
 }
 
-/* Change the IO thread CPU pinning */
-int nvme_mdev_vctrl_bind_iothread(struct nvme_mdev_vctrl *vctrl,
-				  unsigned int cpu)
-{
-	int ret = 0;
-
-	if (cpu >= nr_cpu_ids || !cpu_online(cpu))
-		return -EINVAL;
-
-	mutex_lock(&vctrl->lock);
-
-	if (cpu == vctrl->iothread_cpu && vctrl->iothread)
-		goto out;
-
-	nvme_mdev_io_free(vctrl);
-	ret = nvme_mdev_io_create(vctrl, cpu);
-out:
-	mutex_unlock(&vctrl->lock);
-	return ret;
-}
-
 /* Change the status of support for shadow doorbell */
 int nvme_mdev_vctrl_set_shadow_doorbell_supported(struct nvme_mdev_vctrl *vctrl,
 						  bool enable)
@@ -98,6 +77,7 @@ int nvme_mdev_vctrl_create(struct nvme_mdev_vctrl *vctrl,
 	spin_lock_init(&vctrl->viommu.unmap_lock);
 
 	mutex_init(&vctrl->lock);
+	init_waitqueue_head(&vctrl->io_pause_wq);
 	INIT_LIST_HEAD(&vctrl->link);
 	INIT_LIST_HEAD(&vctrl->host_hw_queues);
 	INIT_WORK(&vctrl->ns_gc_work, nvme_mdev_vns_gc_work);
@@ -118,18 +98,10 @@ int nvme_mdev_vctrl_create(struct nvme_mdev_vctrl *vctrl,
 
 	nvme_mdev_irqs_setup(vctrl);
 
-	/* Create the IO thread */
-	/*TODOLATER: IO: smp_processor_id() is not an ideal pinning choice */
-	ret = nvme_mdev_io_create(vctrl, raw_smp_processor_id());
-	if (ret)
-		goto error3;
-
 	nvme_mdev_hctrl_get(hctrl);
 	vctrl->created = true;
 	_INFO(vctrl, "device created using %d host queues\n", max_host_queues);
 	return 0;
-error3:
-	nvme_mdev_mmio_free(vctrl);
 error2:
 	nvme_mdev_pci_free(vctrl);
 	return ret;
@@ -233,6 +205,11 @@ int nvme_mdev_vctrl_open(struct nvme_mdev_vctrl *vctrl)
 
 	nvme_mdev_viommu_init(&vctrl->viommu, &vctrl->vdev);
 
+	/* in the context of the process opening the device, see there */
+	ret = nvme_mdev_io_create(vctrl);
+	if (ret)
+		goto out;
+
 	nvme_mdev_mmio_open(vctrl);
 	vctrl->inuse = true;
 
@@ -245,7 +222,8 @@ out:
 void nvme_mdev_vctrl_release(struct nvme_mdev_vctrl *vctrl)
 {
 	mutex_lock(&vctrl->lock);
-	nvme_mdev_io_pause(vctrl);
+	/* drains its host I/O and stops it; the next user gets a new one */
+	nvme_mdev_io_free(vctrl);
 
 	/*
 	 * Reset the controller to a clean state for a new user.  This deletes

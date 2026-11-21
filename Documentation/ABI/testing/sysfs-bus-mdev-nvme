@@ -3,8 +3,13 @@ Date:		November 2026
 Contact:	linux-nvme@lists.infradead.org
 Description:
 		The NVMe mediated device type: a virtual NVMe PCIe controller
-		whose I/O goes through the block layer.  Each instance has
-		its own polling I/O thread.  Writing a UUID to "create" makes
+		whose I/O goes through the block layer.  While an instance
+		is open it has its own polling I/O thread, "nvme-mdev-io",
+		which is a thread of the process that opened the device
+		(e.g. QEMU): its CPU time and I/O are accounted to that
+		process and its cgroups, and it starts out with that
+		process's CPU affinity (change it with sched_setaffinity(2),
+		e.g. taskset -p).  Writing a UUID to "create" makes
 		a new instance (see sysfs-bus-vfio-mdev); at most 16 instances
 		exist at a time ("available_instances").
 
@@ -38,14 +43,6 @@ Description:
 		(RO) One line per namespace of the virtual controller:
 		"VNS<nsid>: <host block device>", followed by " (ro)" for
 		read-only namespaces.
-
-What:		/sys/bus/mdev/devices/<uuid>/settings/iothread_cpu
-Date:		November 2026
-Contact:	linux-nvme@lists.infradead.org
-Description:
-		(RW) The CPU the instance's I/O thread is bound to.  Writing
-		an online CPU number moves the thread there; by default it
-		runs on the CPU the instance was created on.
 
 What:		/sys/bus/mdev/devices/<uuid>/settings/shadow_doorbell
 Date:		November 2026
