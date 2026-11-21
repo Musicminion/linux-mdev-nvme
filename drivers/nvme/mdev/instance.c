@@ -606,36 +606,6 @@ static ssize_t namespaces_show(struct device *dev,
 static DEVICE_ATTR_RO(namespaces);
 
 /* change the cpu binding of the IO threads*/
-static ssize_t iothread_cpu_store(struct device *dev,
-				  struct device_attribute *attr,
-				  const char *buf, size_t count)
-{
-	unsigned long val;
-	int ret;
-	struct nvme_mdev_vctrl *vctrl = dev_to_vctrl(dev);
-
-	if (!vctrl)
-		return -ENODEV;
-	ret = kstrtoul(buf, 10, &val);
-	if (ret)
-		return ret;
-	ret = nvme_mdev_vctrl_bind_iothread(vctrl, val);
-	return ret ? ret : count;
-}
-
-/* change the cpu binding of the IO threads*/
-static ssize_t
-iothread_cpu_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct nvme_mdev_vctrl *vctrl = dev_to_vctrl(dev);
-
-	if (!vctrl)
-		return -ENODEV;
-	return sysfs_emit(buf, "%u\n", vctrl->iothread_cpu);
-}
-static DEVICE_ATTR_RW(iothread_cpu);
-
-/* change the cpu binding of the IO threads*/
 static ssize_t shadow_doorbell_store(struct device *dev,
 				     struct device_attribute *attr,
 				     const char *buf, size_t count)
@@ -708,7 +678,6 @@ static ssize_t poll_timeout_ms_show(struct device *dev,
 static DEVICE_ATTR_RW(poll_timeout_ms);
 
 static struct attribute *nvme_mdev_dev_settings_atttributes[] = {
-	&dev_attr_iothread_cpu.attr,
 	&dev_attr_shadow_doorbell.attr,
 	&dev_attr_poll_timeout_ms.attr,
 	NULL

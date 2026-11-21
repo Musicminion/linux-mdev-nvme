@@ -4,7 +4,9 @@
  * Copyright (c) 2019 - Maxim Levitsky
  */
 #include <linux/kernel.h>
-#include <linux/kthread.h>
+#include <linux/sched/signal.h>
+#include <linux/sched/vhost_task.h>
+#include <linux/wait.h>
 #include <linux/slab.h>
 #include <linux/nvme.h>
 #include <linux/timekeeping.h>
@@ -345,8 +347,8 @@ static void nvme_mdev_io_polling_loop(struct io_ctx *ctx)
 	ctx->last_admin_poll_time = vctrl->now;
 	ctx->last_io_t = vctrl->now;
 
-	/* main loop */
-	while (!kthread_should_park()) {
+	/* main loop, until paused or killed */
+	while (!READ_ONCE(vctrl->io_pause_req) && !signal_pending(current)) {
 		vctrl->now = ktime_get();
 
 		/* check if we have to exit to support admin polling */
@@ -464,145 +466,182 @@ static void nvme_mdev_io_polling_loop(struct io_ctx *ctx)
 	}
 }
 
-/* the main IO thread */
-static int nvme_mdev_io_polling_thread(void *data)
+/*
+ * One round of the I/O thread.  vhost_task calls this in a loop with the
+ * task state already set to TASK_INTERRUPTIBLE: returning false sleeps
+ * until we are woken by nvme_mdev_io_resume()/_pause() or a signal.
+ */
+static bool nvme_mdev_io_thread_fn(void *data)
 {
-	struct io_ctx ctx;
+	struct io_ctx *ctx = data;
+	struct nvme_mdev_vctrl *vctrl = ctx->vctrl;
 
-	if (kthread_should_stop())
-		return 0;
+	WRITE_ONCE(vctrl->iothread_task, current);
 
-	memset(&ctx, 0, sizeof(struct io_ctx));
-	ctx.vctrl = (struct nvme_mdev_vctrl *)data;
-	ctx.hctrl = ctx.vctrl->hctrl;
-	nvme_mdev_udata_iter_setup(&ctx.vctrl->viommu, &ctx.udatait);
-
-	_DBG(ctx.vctrl, "IO: iothread started\n");
-
-	for (;;) {
-		if (kthread_should_park()) {
-			_DBG(ctx.vctrl, "IO: iothread parked\n");
-			kthread_parkme();
-		}
-
-		if (kthread_should_stop())
-			break;
-
-		/*
-		 * Idle: sleep until a doorbell write kicks us (or we are parked
-		 * or stopped).  io_idle is only cleared under vctrl->lock.
-		 */
-		set_current_state(TASK_INTERRUPTIBLE);
-		if (READ_ONCE(ctx.vctrl->io_idle) && !kthread_should_park() &&
-		    !kthread_should_stop()) {
-			schedule();
-			continue;
-		}
-		__set_current_state(TASK_RUNNING);
-
-		nvme_mdev_io_polling_loop(&ctx);
+	/* pairs with smp_store_release() in nvme_mdev_io_pause() */
+	if (smp_load_acquire(&vctrl->io_pause_req)) {
+		/* all our work is done: tell nvme_mdev_io_pause() */
+		smp_store_release(&vctrl->io_pause_ack, true);
+		wake_up(&vctrl->io_pause_wq);
+		return false;
 	}
 
-	_DBG(ctx.vctrl, "IO: iothread stopped\n");
-	return 0;
+	/* idle: wait for a doorbell write.  io_idle is only cleared under
+	 * vctrl->lock, by nvme_mdev_io_resume()'s callers.
+	 */
+	if (READ_ONCE(vctrl->io_idle))
+		return false;
+
+	__set_current_state(TASK_RUNNING);
+	nvme_mdev_io_polling_loop(ctx);
+	return true;
+}
+
+/*
+ * The process the thread belongs to got SIGKILL: the thread exits without
+ * being stopped.  It drained its host I/O before (the polling loop stops on
+ * a pending signal), so just let nvme_mdev_io_pause() callers go.
+ */
+static void nvme_mdev_io_thread_killed(void *data)
+{
+	struct io_ctx *ctx = data;
+
+	_DBG(ctx->vctrl, "IO: iothread killed\n");
+	WRITE_ONCE(ctx->vctrl->io_dead, true);
+	wake_up(&ctx->vctrl->io_pause_wq);
+}
+
+static bool nvme_mdev_io_is_self(struct nvme_mdev_vctrl *vctrl)
+{
+	return current == READ_ONCE(vctrl->iothread_task);
 }
 
 /*
  * Undo nvme_mdev_io_pause(), and wake the thread up if it has work (it
  * goes back to sleep by itself if io_idle is still set).
- *
- * Only ever park/unpark the thread from other threads: kthread_park()
- * on itself leaves the "parked" completion signalled, and a later
- * kthread_park() from another thread then returns before the thread
- * actually parked (2019 parked itself when idle).  The I/O thread runs
- * nothing else while it is in here anyway.
  */
 void nvme_mdev_io_resume(struct nvme_mdev_vctrl *vctrl)
 {
 	lockdep_assert_held(&vctrl->lock);
 
-	if (!vctrl->iothread || current == vctrl->iothread ||
-	    vctrl->vctrl_paused)
+	if (!vctrl->iothread || nvme_mdev_io_is_self(vctrl) ||
+	    vctrl->vctrl_paused || READ_ONCE(vctrl->io_dead))
 		return;
 
 	if (vctrl->iothread_parked) {
 		vctrl->iothread_parked = false;
-		kthread_unpark(vctrl->iothread);
+		WRITE_ONCE(vctrl->io_pause_req, false);
 	}
 	if (!READ_ONCE(vctrl->io_idle))
-		wake_up_process(vctrl->iothread);
+		vhost_task_wake(vctrl->iothread);
 }
 
-/* Pause the IO thread (waits until it is parked) */
+static bool nvme_mdev_io_paused(struct nvme_mdev_vctrl *vctrl)
+{
+	/*
+	 * Acquire: what the thread did before it acknowledged the pause
+	 * (completion entries, its view of the queues) is visible to us
+	 * afterwards; pairs with its smp_store_release().
+	 */
+	return smp_load_acquire(&vctrl->io_pause_ack) ||
+	       READ_ONCE(vctrl->io_dead);
+}
+
+/*
+ * Pause the IO thread: returns once it finished what it was doing (its
+ * host I/O drained) and sleeps until nvme_mdev_io_resume().  Not from the
+ * thread itself, which runs nothing else while it is in here anyway.
+ */
 void nvme_mdev_io_pause(struct nvme_mdev_vctrl *vctrl)
 {
 	lockdep_assert_held(&vctrl->lock);
 
-	if (!vctrl->iothread || current == vctrl->iothread ||
+	if (!vctrl->iothread || nvme_mdev_io_is_self(vctrl) ||
 	    vctrl->iothread_parked)
 		return;
 
 	vctrl->iothread_parked = true;
-	kthread_park(vctrl->iothread);
+	WRITE_ONCE(vctrl->io_pause_ack, false);
+	/* the thread must not see the request with a stale ack */
+	smp_store_release(&vctrl->io_pause_req, true);
+	vhost_task_wake(vctrl->iothread);
+	wait_event(vctrl->io_pause_wq, nvme_mdev_io_paused(vctrl));
 }
 
-/* setup the main IO thread */
-int nvme_mdev_io_create(struct nvme_mdev_vctrl *vctrl, unsigned int cpu)
+/*
+ * Set up the IO thread.  Called when the device is opened, from the
+ * context of the process that opens it (QEMU): the thread becomes one of
+ * its threads, see vhost_task_create().
+ */
+int nvme_mdev_io_create(struct nvme_mdev_vctrl *vctrl)
 {
-	/*TODOLATER: IO: Better thread name*/
-	char name[TASK_COMM_LEN];
+	struct vhost_task *vtsk;
+	struct io_ctx *ctx;
 
 	_DBG(vctrl, "IO: creating the polling iothread\n");
 
+	lockdep_assert_held(&vctrl->lock);
 	if (WARN_ON(vctrl->iothread))
 		return -EINVAL;
 
-	snprintf(name, sizeof(name), "nvme%d_poll_io", vctrl->hctrl->id);
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+	ctx->vctrl = vctrl;
+	ctx->hctrl = vctrl->hctrl;
+	nvme_mdev_udata_iter_setup(&vctrl->viommu, &ctx->udatait);
 
-	vctrl->iothread_cpu = cpu;
 	vctrl->iothread_parked = false;
+	vctrl->io_pause_req = false;
+	vctrl->io_pause_ack = false;
+	vctrl->io_dead = false;
+	vctrl->iothread_task = NULL;
 	WRITE_ONCE(vctrl->io_idle, true);
 
-	vctrl->iothread = kthread_create_on_node(nvme_mdev_io_polling_thread,
-						 vctrl,
-						 vctrl->hctrl->node,
-						 name);
-	if (IS_ERR(vctrl->iothread)) {
-		int ret = PTR_ERR(vctrl->iothread);
-
-		vctrl->iothread = NULL;
-		return ret;
+	vtsk = vhost_task_create(nvme_mdev_io_thread_fn,
+				 nvme_mdev_io_thread_killed, ctx,
+				 "nvme-mdev-io");
+	if (IS_ERR(vtsk)) {
+		kfree(ctx);
+		return PTR_ERR(vtsk);
 	}
 
-	kthread_bind(vctrl->iothread, cpu);
+	vctrl->io_ctx = ctx;
+	vctrl->iothread = vtsk;
 	/* it goes to sleep right away: io_idle is set */
-	wake_up_process(vctrl->iothread);
+	vhost_task_start(vtsk);
 	return 0;
 }
 
-/* End the  main IO thread */
+/* End the main IO thread */
 void nvme_mdev_io_free(struct nvme_mdev_vctrl *vctrl)
 {
-	int ret;
-
 	_DBG(vctrl, "IO: destroying the polling iothread\n");
 
 	lockdep_assert_held(&vctrl->lock);
 	if (!vctrl->iothread)
 		return;
+
+	/* let it finish its host I/O first */
 	nvme_mdev_io_pause(vctrl);
-	ret = kthread_stop(vctrl->iothread);
-	WARN_ON(ret);
+	vhost_task_stop(vctrl->iothread);
+
 	vctrl->iothread = NULL;
+	vctrl->iothread_task = NULL;
+	vctrl->iothread_parked = false;
+	kfree(vctrl->io_ctx);
+	vctrl->io_ctx = NULL;
 }
 
 /*
- * The I/O thread must not be working: parked, or idle (it doesn't touch
- * anything while io_idle is set, and that is only cleared under the lock).
+ * The I/O thread must not be working: paused, idle (it doesn't touch
+ * anything while io_idle is set, and that is only cleared under the lock),
+ * or gone.
  */
 void nvme_mdev_assert_io_not_running(struct nvme_mdev_vctrl *vctrl)
 {
-	if (WARN_ON(vctrl->iothread && current != vctrl->iothread &&
-		    !vctrl->iothread_parked && !READ_ONCE(vctrl->io_idle)))
+	if (WARN_ON(vctrl->iothread && !nvme_mdev_io_is_self(vctrl) &&
+		    !vctrl->iothread_parked && !READ_ONCE(vctrl->io_idle) &&
+		    !READ_ONCE(vctrl->io_dead)))
 		nvme_mdev_io_pause(vctrl);
 }

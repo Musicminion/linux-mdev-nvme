@@ -281,6 +281,9 @@ struct nvme_mdev_io_region {
 	unsigned int mmap_area_size;
 };
 
+struct io_ctx;
+struct vhost_task;
+
 /*Virtual NVME controller state */
 struct nvme_mdev_vctrl {
 	struct vfio_device vdev;	/* must be first, see vfio_alloc_device */
@@ -323,9 +326,20 @@ struct nvme_mdev_vctrl {
 	/* removes namespaces whose host block device went away */
 	struct work_struct ns_gc_work;
 
-	/* the IO thread */
-	struct task_struct *iothread;
-	bool iothread_parked;
+	/*
+	 * The I/O thread: a vhost_task, i.e. a thread of the process that
+	 * opened the device (QEMU), so that its CPU time and the bios it
+	 * submits are accounted to that process and its cgroups.  It exists
+	 * while the device is open.
+	 */
+	struct vhost_task *iothread;
+	struct io_ctx *io_ctx;
+	struct task_struct *iothread_task;	/* set by the thread itself */
+	bool iothread_parked;		/* paused, under lock */
+	bool io_pause_req;		/* set/cleared under lock */
+	bool io_pause_ack;		/* the thread saw io_pause_req */
+	bool io_dead;			/* the thread was killed (SIGKILL) */
+	wait_queue_head_t io_pause_wq;
 	bool io_idle;
 	ktime_t now;
 
@@ -333,7 +347,6 @@ struct nvme_mdev_vctrl {
 	unsigned int arb_burst_shift;
 	bool write_atomicity_dn;	/* feature 0x0a, Disable Normal */
 	u8 worload_hint;
-	unsigned int iothread_cpu;
 	unsigned int poll_timeout_ms;	/* 0: never stop polling */
 
 	/* Identification*/
@@ -443,9 +456,6 @@ void nvme_mdev_vctrl_region_set_mmap(struct nvme_mdev_vctrl *vctrl,
 void nvme_mdev_vctrl_region_disable_mmap(struct nvme_mdev_vctrl *vctrl,
 					 unsigned int index);
 
-int nvme_mdev_vctrl_bind_iothread(struct nvme_mdev_vctrl *vctrl,
-				  unsigned int cpu);
-
 int nvme_mdev_vctrl_set_shadow_doorbell_supported(struct nvme_mdev_vctrl *vctrl,
 						  bool enable);
 
@@ -484,7 +494,7 @@ extern struct list_head nvme_mdev_vctrl_list;
 extern struct mutex nvme_mdev_vctrl_list_mutex;
 
 /* io.c */
-int nvme_mdev_io_create(struct nvme_mdev_vctrl *vctrl, unsigned int cpu);
+int nvme_mdev_io_create(struct nvme_mdev_vctrl *vctrl);
 void nvme_mdev_io_free(struct nvme_mdev_vctrl *vctrl);
 void nvme_mdev_io_pause(struct nvme_mdev_vctrl *vctrl);
 void nvme_mdev_io_resume(struct nvme_mdev_vctrl *vctrl);
