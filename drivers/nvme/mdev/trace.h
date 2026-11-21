@@ -22,6 +22,7 @@ TRACE_EVENT(nvme_mdev_io_submit,
 		__field(u16, cid)
 		__field(u32, nsid)
 		__field(u8, opcode)
+		__field(u8, flags)
 		__field(u64, slba)
 		__field(u16, length)
 	),
@@ -31,12 +32,14 @@ TRACE_EVENT(nvme_mdev_io_submit,
 		__entry->cid = nvme_mdev_cmd_cid(cmd);
 		__entry->nsid = le32_to_cpu(cmd->common.nsid);
 		__entry->opcode = cmd->common.opcode;
+		__entry->flags = cmd->common.flags;
 		__entry->slba = le64_to_cpu(cmd->rw.slba);
 		__entry->length = le16_to_cpu(cmd->rw.length);
 	),
-	TP_printk("%s sqid=%u cid=%u nsid=%u opcode=0x%x slba=%llu length=%u",
+	TP_printk("%s sqid=%u cid=%u nsid=%u opcode=0x%x flags=0x%x slba=%llu length=%u",
 		  __get_str(dev), __entry->sqid, __entry->cid, __entry->nsid,
-		  __entry->opcode, __entry->slba, __entry->length)
+		  __entry->opcode, __entry->flags, __entry->slba,
+		  __entry->length)
 );
 
 TRACE_EVENT(nvme_mdev_io_complete,
