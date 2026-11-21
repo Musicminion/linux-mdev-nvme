@@ -26,20 +26,10 @@ int nvme_mdev_vsq_init(struct nvme_mdev_vctrl *vctrl,
 	q->head = 0;
 	q->vcq = &vctrl->vcqs[cqid];
 	q->data = NULL;
-	q->hsq = 0;
 
 	ret = nvme_mdev_vsq_viommu_update(&vctrl->viommu, q);
 	if (ret && (ret != -EFAULT))
 		return ret;
-
-	if (qid > 0) {
-		ret = nvme_mdev_vctrl_hq_alloc(vctrl);
-		if (ret < 0) {
-			vunmap(q->data);
-			return ret;
-		}
-		q->hsq = ret;
-	}
 
 	_DBG(vctrl, "VSQ: create qid=%d contig=%d, depth=%d cqid=%d\n",
 	     qid, cont, size, cqid);
@@ -81,11 +71,6 @@ void nvme_mdev_vsq_delete(struct nvme_mdev_vctrl *vctrl, u16 qid)
 	if (q->data)
 		vunmap(q->data);
 	q->data = NULL;
-
-	if (q->hsq) {
-		nvme_mdev_vctrl_hq_free(vctrl, q->hsq);
-		q->hsq = 0;
-	}
 
 	clear_bit(qid, vctrl->vsq_en);
 }
@@ -185,18 +170,19 @@ bool nvme_mdev_vsq_suspend_io(struct nvme_mdev_vctrl *vctrl, u16 sqid)
 
 /* complete a command (IO version)*/
 void nvme_mdev_vsq_cmd_done_io(struct nvme_mdev_vctrl *vctrl,
-			       u16 sqid, u16 cid, u16 status)
+			       u16 sqid, u16 cid, u16 status, __le64 result)
 {
 	struct nvme_vsq *q = &vctrl->vsqs[sqid];
 
-	nvme_mdev_vcq_write_io(vctrl, q->vcq, q->head, q->qid, cid, status);
+	nvme_mdev_vcq_write_io(vctrl, q->vcq, result, q->head, q->qid, cid,
+			       status);
 }
 
 /* complete a command (ADMIN version)*/
 void nvme_mdev_vsq_cmd_done_adm(struct nvme_mdev_vctrl *vctrl,
-				u32 dw0, u16 cid, u16 status)
+				__le64 result, u16 cid, u16 status)
 {
 	struct nvme_vsq *q = &vctrl->vsqs[0];
 
-	nvme_mdev_vcq_write_adm(vctrl, q->vcq, dw0, q->head, cid, status);
+	nvme_mdev_vcq_write_adm(vctrl, q->vcq, result, q->head, cid, status);
 }

@@ -12,7 +12,7 @@
 #define MMIO_BAR_SIZE __roundup_pow_of_two(NVME_REG_DBS + DB_AREA_SIZE)
 
 /* Put the controller into fatal error state. Only way out is reset */
-static void nvme_mdev_mmio_fatal_error(struct nvme_mdev_vctrl *vctrl)
+void nvme_mdev_mmio_fatal_error(struct nvme_mdev_vctrl *vctrl)
 {
 	if (vctrl->mmio.csts & NVME_CSTS_CFS)
 		return;
@@ -24,11 +24,14 @@ static void nvme_mdev_mmio_fatal_error(struct nvme_mdev_vctrl *vctrl)
 		nvme_mdev_vctrl_disable(vctrl);
 }
 
-/* This sends an generic error notification to the user */
+/*
+ * An invalid doorbell write.  The spec has the controller report it with
+ * an error event; nvmet raises its events itself, so we only log it.
+ */
 static void nvme_mdev_mmio_error(struct nvme_mdev_vctrl *vctrl,
 				 enum nvme_async_event info)
 {
-	nvme_mdev_event_send(vctrl, NVME_AER_TYPE_ERROR, info);
+	_DBG(vctrl, "MMIO: invalid doorbell write (0x%x)\n", info);
 }
 
 /* This is memory fault handler for the mmap area of the doorbells*/
@@ -146,13 +149,7 @@ static void nvme_mdev_mmio_cntrl_enable(struct nvme_mdev_vctrl *vctrl)
 	if (nvme_mdev_vctrl_is_dead(vctrl))
 		goto error;
 
-	/* only NVME command set supported */
-	if (((vctrl->mmio.cc >> NVME_CC_CSS_SHIFT) & 0x7) != 0)
-		goto error;
-
-	/* Check the queue arbitration method*/
-	if ((vctrl->mmio.cc & NVME_CC_AMS_MASK) != NVME_CC_AMS_RR)
-		goto error;
+	/* (nvmet checks the command set, arbitration and entry sizes) */
 
 	/* Check the page size*/
 	if (((vctrl->mmio.cc >> NVME_CC_MPS_SHIFT) & 0xF) != (PAGE_SHIFT - 12))
@@ -235,7 +232,9 @@ static int nvme_mdev_mmio_bar_access(struct nvme_mdev_vctrl *vctrl,
 	case NVME_REG_VS:
 		if (is_write)
 			goto drop;
-		store_le32(buf, NVME_MDEV_NVME_VER);
+		/* what nvmet implements, like Identify says */
+		store_le32(buf, vctrl->tctrl ? vctrl->tctrl->subsys->ver :
+			   NVME_MDEV_NVME_VER);
 		break;
 
 	case NVME_REG_INTMS:
@@ -379,7 +378,11 @@ static int nvme_mdev_mmio_bar_access(struct nvme_mdev_vctrl *vctrl,
 		break;
 	}
 	default:
-		goto drop;
+		/* registers we don't implement are reserved: read as 0 */
+		if (is_write)
+			goto drop;
+		store_le32(buf, 0);
+		break;
 	}
 
 	mutex_unlock(&vctrl->lock);
@@ -461,6 +464,30 @@ error1:
 	put_page(vctrl->mmio.dbs_page);
 error0:
 	return ret;
+}
+
+/*
+ * Base CAP on what the nvmet controller supports (MQES, TO, CSS), like
+ * pci-epf does, but with our doorbell stride and page size, and queues
+ * that need not be physically contiguous.
+ */
+void nvme_mdev_mmio_set_cap(struct nvme_mdev_vctrl *vctrl, u64 tcap)
+{
+	u64 mqes = min_t(u64, NVME_CAP_MQES(tcap), MAX_VIRTUAL_QUEUE_DEPTH - 1);
+
+	vctrl->mmio.cap = (tcap & ~(GENMASK_ULL(15, 0) |	/* MQES */
+				    BIT_ULL(16) |		/* CQR */
+				    GENMASK_ULL(18, 17) |	/* AMS */
+				    GENMASK_ULL(35, 32) |	/* DSTRD */
+				    BIT_ULL(36) |		/* NSSRS */
+				    BIT_ULL(45) |		/* BPS */
+				    GENMASK_ULL(55, 48) |	/* MPSMIN/MAX */
+				    BIT_ULL(56) |		/* PMRS */
+				    BIT_ULL(57))) |		/* CMBS */
+			  mqes |
+			  ((u64)DB_STRIDE_SHIFT << 32) |
+			  ((u64)(PAGE_SHIFT - 12) << 48) |
+			  ((u64)(PAGE_SHIFT - 12) << 52);
 }
 
 /* Called when the virtual controller is reset */

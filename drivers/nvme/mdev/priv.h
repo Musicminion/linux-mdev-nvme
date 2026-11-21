@@ -18,13 +18,18 @@
 #include <linux/bio.h>
 #include <linux/eventfd.h>
 #include <linux/workqueue.h>
-#include <linux/dmapool.h>
+#include <linux/llist.h>
 #include <linux/byteorder/generic.h>
+#include "../target/nvmet.h"
 #include "spec.h"
 #include "mdev.h"
 
 #define NVME_MDEV_NVME_VER  NVME_VS(0x01, 0x03, 0x00)
 #define NVME_MDEV_FIRMWARE_VERSION "1.0"
+
+/* Maximum Data Transfer Size: 2^7 4k pages, 512k */
+#define NVME_MDEV_MDTS		7
+#define NVME_MDEV_MAX_XFER	(1U << (NVME_MDEV_MDTS + 12))
 
 #define NVME_MDEV_PCI_VENDOR_ID		PCI_VENDOR_ID_REDHAT_QUMRANET
 #define NVME_MDEV_PCI_DEVICE_ID		0x1234
@@ -35,20 +40,10 @@
 #define DB_STRIDE_SHIFT 4 /*4 = 1 cacheline */
 #define MAX_VIRTUAL_QUEUES 16
 #define MAX_VIRTUAL_QUEUE_DEPTH 0xFFFF
-#define MAX_VIRTUAL_NAMESPACES 16 /* NSID = 1..16*/
 #define MAX_VIRTUAL_IRQS 16
-
-/*
- * Each virtual controller has one I/O thread and one "host queue": the
- * list of the bios it has in flight (all its guest queues share it).
- */
-#define MAX_HOST_QUEUES 1
 
 /* how many virtual controllers can be created */
 #define NVME_MDEV_MAX_INSTANCES 16
-
-#define MAX_AER_COMMANDS 16
-#define MAX_LOG_PAGES 16
 
 /*
  * How long to wait for the host I/O to complete when the I/O thread is
@@ -73,8 +68,6 @@ struct  nvme_vsq {
 
 	dma_addr_t iova;
 	bool cont;
-
-	u16 hsq;
 };
 
 /* virtual completion queue*/
@@ -97,38 +90,6 @@ struct nvme_vcq {
 
 	dma_addr_t iova;
 	bool cont;
-};
-
-/*A virtual namespace */
-struct nvme_mdev_vns {
-	struct nvme_mdev_vctrl *vctrl;
-
-	/*
-	 * The host block device (a namespace or a partition of it), opened
-	 * exclusively with this vns as the holder.
-	 */
-	struct file *bdev_file;
-	struct block_device *host_part;
-
-	/* set by the block layer when the host device goes away */
-	bool dead;
-
-	u32 nsid;
-
-	/* size of each block on the real namespace, same for host and guest */
-	u8 blksize_shift;
-
-	/* size of the namespace in lbas*/
-	u64 ns_size;
-
-	/* is the namespace read only?*/
-	bool readonly;
-
-	/* UUID of this namespace */
-	uuid_t uuid;
-
-	/* Optimal IO boundary*/
-	u16 noiob;
 };
 
 /*
@@ -239,30 +200,6 @@ struct nvme_mdev_user_irqs {
 	struct eventfd_ctx *request_trigger;
 };
 
-/*AER state */
-struct nvme_mdev_user_events {
-	/* async event request CIDs*/
-	u16 aer_cids[MAX_AER_COMMANDS];
-	unsigned int aer_cid_count;
-
-	/* events that are enabled */
-	unsigned long events_enabled[BITS_TO_LONGS(MAX_LOG_PAGES)];
-
-	/* events that are masked till next log page read*/
-	unsigned long events_masked[BITS_TO_LONGS(MAX_LOG_PAGES)];
-
-	/* events that are pending to be sent when user gives us an AER*/
-	unsigned long  events_pending[BITS_TO_LONGS(MAX_LOG_PAGES)];
-	u32 event_values[MAX_LOG_PAGES];
-};
-
-/* host IO queue */
-struct nvme_mdev_hq {
-	unsigned int usecount;
-	struct list_head link;
-	unsigned int hqid;
-};
-
 /* IO region abstraction (BARs, the PCI config space */
 struct nvme_mdev_vctrl;
 typedef int (*region_access_fn) (struct nvme_mdev_vctrl *vctrl,
@@ -301,12 +238,6 @@ struct nvme_mdev_vctrl {
 	struct nvme_mdev_user_ctrl_mmio mmio;
 	struct nvme_mdev_pci_cfg_space pcicfg;
 	struct nvme_mdev_user_irqs irqs;
-	struct nvme_mdev_user_events events;
-
-	/* emulated namespaces */
-	struct nvme_mdev_vns *namespaces[MAX_VIRTUAL_NAMESPACES];
-	__le32 ns_log[MAX_VIRTUAL_NAMESPACES];
-	unsigned int ns_log_size;
 
 	/* emulated submission queues*/
 	struct nvme_vsq vsqs[MAX_VIRTUAL_QUEUES];
@@ -316,15 +247,37 @@ struct nvme_mdev_vctrl {
 	unsigned long vcq_en[BITS_TO_LONGS(MAX_VIRTUAL_QUEUES)];
 	struct nvme_vcq vcqs[MAX_VIRTUAL_QUEUES];
 
-	/* Host IO queues*/
-	int max_host_hw_queues;
-	struct list_head host_hw_queues;
-
 	/* Interface to access user memory */
 	struct nvme_mdev_viommu viommu;
 
-	/* removes namespaces whose host block device went away */
-	struct work_struct ns_gc_work;
+	/*
+	 * The NVMe target (nvmet) controller that executes the commands.
+	 * Created when the device is opened, from the nvmet port and
+	 * subsystem configured in the "nvmet" sysfs attributes; nvmet can
+	 * delete it (e.g. when the subsystem is unlinked from the port), a
+	 * controller reset then tries to create a new one.
+	 */
+	struct nvmet_ctrl *tctrl;
+	u16 portid;
+	char subsysnqn[NVMF_NQN_SIZE];
+	char hostnqn[NVMF_NQN_SIZE];
+	unsigned long nvmet_flags;	/* NVME_MDEV_NVMET_* */
+	struct work_struct nvmet_delete_work;
+
+	/* the nvmet side of each guest queue */
+	struct nvmet_sq tsqs[MAX_VIRTUAL_QUEUES];
+	struct nvmet_cq tcqs[MAX_VIRTUAL_QUEUES];
+
+	/*
+	 * Commands nvmet completed (from any context, e.g. a bio's end_io),
+	 * waiting for their completion entry to be written: admin commands
+	 * by nvme_mdev_adm_process_sq() or adm_done_work (under the lock),
+	 * I/O commands by the I/O thread.
+	 */
+	struct llist_head adm_done;
+	struct llist_head io_done;
+	struct work_struct adm_done_work;
+	atomic_t io_inflight;		/* I/O commands not completed yet */
 
 	/*
 	 * The I/O thread: a vhost_task, i.e. a thread of the process that
@@ -345,62 +298,26 @@ struct nvme_mdev_vctrl {
 
 	/* Settings */
 	unsigned int arb_burst_shift;
-	bool write_atomicity_dn;	/* feature 0x0a, Disable Normal */
-	u8 worload_hint;
 	unsigned int poll_timeout_ms;	/* 0: never stop polling */
-
-	/* Identification*/
-	char subnqn[256];
-	char serial[9];
 
 	bool vctrl_paused; /* true when the host device paused our IO */
 
 };
 
+/* nvmet_flags */
+#define NVME_MDEV_NVMET_DELETE	0	/* nvmet wants the controller gone */
+
 /* mdev instance type*/
 struct nvme_mdev_inst_type {
 	struct mdev_type type;
-	unsigned int max_hw_queues;
 	char name[16];
 };
 
-#define MDEV_NVME_BIO_QUEUE_SIZE 128
-#define NVME_STATUS_PENDING 0xFFFF
-#define MDEV_NVME_NUM_BIO_QUEUES NVME_MDEV_MAX_INSTANCES
-
-struct mbio {
-	/* link in a list of pending bios*/
-	struct list_head link;
-
-	/* tag from the translation (user cid + user qid) */
-	u32 tag;
-
-	/* result NVME status, written by the completion handler */
-	u16 status;
-
-	/* Write Zeroes with FUA: flush once the zeroing is done */
-	bool flush_after;
-	struct block_device *bdev;
-
-	/* must be last for bioset allocation*/
-	struct bio bio;
-};
-
-struct hw_mbio_queue {
-	int inflight;
-	struct list_head bios_in_flight;
-	struct bio_set bioset;
-};
-
 /*
- * The "host": where the virtual controllers' I/O goes.  With the block
- * layer backend there is one for the whole module; it is the mdev parent
- * and hangs off the "nvme_mdev" class device.
+ * The mdev parent: there is one for the whole module, it hangs off the
+ * "nvme_mdev" class device.  The I/O goes to nvmet.
  */
 struct nvme_mdev_hctrl {
-	struct mutex lock;	/* protects hw_queues[] */
-
-	/* numa node of the host controller*/
 	int node;
 
 	struct kref ref;
@@ -410,22 +327,27 @@ struct nvme_mdev_hctrl {
 	struct device *parent_dev;
 	struct mdev_parent mparent;
 	struct nvme_mdev_inst_type type;
-	struct mdev_type *type_ptrs[1];
+	struct mdev_type *type_ptr;
+};
 
-	/* Host area*/
-	u16 oncs;
-	u8 mdts;
-	unsigned int id;
+/* A command, from the guest's queue to nvmet and back */
+struct nvme_mdev_iod {
+	struct nvmet_req req;
+	struct nvme_command cmd;	/* copied out of the guest's queue */
+	struct nvme_completion cqe;
+	struct nvme_mdev_vctrl *vctrl;
+	struct llist_node done;
+	u16 sqid;
 
-	/* one bio list per virtual controller (MAX_HOST_QUEUES each) */
-	struct hw_mbio_queue *hw_queues[MDEV_NVME_NUM_BIO_QUEUES];
+	/* the command's data: the guest's pages, no bounce buffer */
+	struct sg_table sgt;
+	struct scatterlist inline_sg[2];
 };
 
 /* vctrl.c*/
 int nvme_mdev_vctrl_create(struct nvme_mdev_vctrl *vctrl,
 			   struct mdev_device *mdev,
-			   struct nvme_mdev_hctrl *hctrl,
-			   unsigned int max_host_queues);
+			   struct nvme_mdev_hctrl *hctrl);
 
 void nvme_mdev_vctrl_destroy(struct nvme_mdev_vctrl *vctrl);
 
@@ -459,9 +381,6 @@ void nvme_mdev_vctrl_region_disable_mmap(struct nvme_mdev_vctrl *vctrl,
 int nvme_mdev_vctrl_set_shadow_doorbell_supported(struct nvme_mdev_vctrl *vctrl,
 						  bool enable);
 
-int nvme_mdev_vctrl_hq_alloc(struct nvme_mdev_vctrl *vctrl);
-void nvme_mdev_vctrl_hq_free(struct nvme_mdev_vctrl *vctrl, u16 qid);
-unsigned int nvme_mdev_vctrl_hqs_list(struct nvme_mdev_vctrl *vctrl, u16 *out);
 bool nvme_mdev_vctrl_is_dead(struct nvme_mdev_vctrl *vctrl);
 
 void nvme_mdev_vctrl_viommu_unmap(struct nvme_mdev_vctrl *vctrl,
@@ -472,21 +391,24 @@ ssize_t nvme_mdev_type_show_description(struct mdev_type *mtype, char *buf);
 void nvme_mdev_hctrl_get(struct nvme_mdev_hctrl *hctrl);
 void nvme_mdev_hctrl_put(struct nvme_mdev_hctrl *hctrl);
 
-int nvme_mdev_hctrl_hq_alloc(struct nvme_mdev_hctrl *hctrl);
-void nvme_mdev_hctrl_hq_free(struct nvme_mdev_hctrl *hctrl, u16 qid);
-bool nvme_mdev_hctrl_hq_can_submit(struct nvme_mdev_hctrl *hctrl, u16 qid);
-bool nvme_mdev_hctrl_hq_check_op(struct nvme_mdev_hctrl *hctrl, u8 optcode);
-
-int nvme_mdev_hctrl_hq_submit(struct nvme_mdev_hctrl *hctrl,
-			      struct nvme_mdev_vns *vns,
-			      u16 qid, u32 tag,
-			      struct nvme_command *cmd,
-			      struct nvme_ext_data_iter *datait);
-
-int nvme_mdev_hctrl_hq_poll(struct nvme_mdev_hctrl *hctrl,
-			    u32 qid,
-			    struct nvme_ext_cmd_result *results,
-			    unsigned int max_len);
+/* nvmet.c */
+int nvme_mdev_nvmet_init(void);
+void nvme_mdev_nvmet_exit(void);
+int nvme_mdev_nvmet_ctrl_create(struct nvme_mdev_vctrl *vctrl);
+void nvme_mdev_nvmet_ctrl_destroy(struct nvme_mdev_vctrl *vctrl);
+void nvme_mdev_nvmet_vctrl_init(struct nvme_mdev_vctrl *vctrl);
+void nvme_mdev_nvmet_vctrl_cleanup(struct nvme_mdev_vctrl *vctrl);
+int nvme_mdev_nvmet_enable(struct nvme_mdev_vctrl *vctrl);
+void nvme_mdev_nvmet_disable(struct nvme_mdev_vctrl *vctrl);
+u16 nvme_mdev_nvmet_create_cq(struct nvme_mdev_vctrl *vctrl, u16 cqid,
+			      u16 flags, u16 qsize, u64 iova, u16 vector);
+u16 nvme_mdev_nvmet_create_sq(struct nvme_mdev_vctrl *vctrl, u16 sqid,
+			      u16 cqid, u16 flags, u16 qsize, u64 iova);
+void nvme_mdev_nvmet_delete_cq(struct nvme_mdev_vctrl *vctrl, u16 cqid);
+void nvme_mdev_nvmet_delete_sq(struct nvme_mdev_vctrl *vctrl, u16 sqid);
+void nvme_mdev_adm_process_sq(struct nvme_mdev_vctrl *vctrl);
+bool nvme_mdev_nvmet_submit_io(struct nvme_mdev_vctrl *vctrl, u16 sqid);
+unsigned int nvme_mdev_nvmet_reap_io(struct nvme_mdev_vctrl *vctrl);
 
 /* instance.c */
 extern struct mdev_driver nvme_mdev_driver;
@@ -502,6 +424,8 @@ void nvme_mdev_assert_io_not_running(struct nvme_mdev_vctrl *vctrl);
 
 /* mmio.c*/
 int nvme_mdev_mmio_create(struct nvme_mdev_vctrl *vctrl);
+void nvme_mdev_mmio_set_cap(struct nvme_mdev_vctrl *vctrl, u64 tcap);
+void nvme_mdev_mmio_fatal_error(struct nvme_mdev_vctrl *vctrl);
 void nvme_mdev_mmio_open(struct nvme_mdev_vctrl *vctrl);
 void nvme_mdev_mmio_reset(struct nvme_mdev_vctrl *vctrl, bool pci_reset);
 void nvme_mdev_mmio_free(struct nvme_mdev_vctrl *vctrl);
@@ -521,23 +445,6 @@ void nvme_mdev_pci_free(struct nvme_mdev_vctrl *vctrl);
 void nvme_mdev_pci_setup_bar(struct nvme_mdev_vctrl *vctrl,
 			     u8 bar, unsigned int size,
 			     region_access_fn access_fn);
-/* adm.c*/
-void nvme_mdev_adm_process_sq(struct nvme_mdev_vctrl *vctrl);
-
-/* events.c */
-void nvme_mdev_events_init(struct nvme_mdev_vctrl *vctrl);
-void nvme_mdev_events_reset(struct nvme_mdev_vctrl *vctrl);
-
-int nvme_mdev_event_request_receive(struct nvme_mdev_vctrl *vctrl, u16 cid);
-void nvme_mdev_event_process_ack(struct nvme_mdev_vctrl *vctrl, u8 log_page);
-
-void nvme_mdev_event_send(struct nvme_mdev_vctrl *vctrl,
-			  enum nvme_async_event_type type,
-			  enum nvme_async_event info);
-
-u32 nvme_mdev_event_read_aen_config(struct nvme_mdev_vctrl *vctrl);
-void nvme_mdev_event_set_aen_config(struct nvme_mdev_vctrl *vctrl, u32 value);
-
 /* irq.c*/
 void nvme_mdev_irqs_setup(struct nvme_mdev_vctrl *vctrl);
 void nvme_mdev_irqs_reset(struct nvme_mdev_vctrl *vctrl);
@@ -563,21 +470,6 @@ void nvme_mdev_irq_cond_trigger(struct nvme_mdev_vctrl *vctrl,
 void nvme_mdev_irq_clear(struct nvme_mdev_vctrl *vctrl,
 			 unsigned int index);
 
-/* vns.c*/
-int nvme_mdev_vns_open(struct nvme_mdev_vctrl *vctrl, const char *path);
-int nvme_mdev_vns_destroy(struct nvme_mdev_vctrl *vctrl,
-			  u32 user_nsid);
-void nvme_mdev_vns_destroy_all(struct nvme_mdev_vctrl *vctrl);
-
-struct nvme_mdev_vns *nvme_mdev_vns_from_vnsid(struct nvme_mdev_vctrl *vctrl,
-					       u32 user_ns_id);
-
-int nvme_mdev_vns_print_description(struct nvme_mdev_vctrl *vctrl,
-				    char *buf, unsigned int size);
-void nvme_mdev_vns_gc_work(struct work_struct *work);
-
-void nvme_mdev_vns_log_reset(struct nvme_mdev_vctrl *vctrl);
-
 /* vcq.c */
 int nvme_mdev_vcq_init(struct nvme_mdev_vctrl *vctrl, u16 qid,
 		       dma_addr_t iova, bool cont, u16 size, int irq);
@@ -593,11 +485,11 @@ bool nvme_mdev_vcq_flush(struct nvme_mdev_vctrl *vctrl, u16 qid);
 bool nvme_mdev_vcq_reserve_space(struct nvme_vcq *q);
 
 void nvme_mdev_vcq_write_io(struct nvme_mdev_vctrl *vctrl,
-			    struct nvme_vcq *q, u16 sq_head,
+			    struct nvme_vcq *q, __le64 result, u16 sq_head,
 			    u16 sqid, u16 cid, u16 status);
 
 void nvme_mdev_vcq_write_adm(struct nvme_mdev_vctrl *vctrl,
-			     struct nvme_vcq *q, u32 dw0,
+			     struct nvme_vcq *q, __le64 result,
 			     u16 sq_head, u16 cid, u16 status);
 /* vsq.c*/
 int nvme_mdev_vsq_init(struct nvme_mdev_vctrl *vctrl, u16 qid,
@@ -615,9 +507,9 @@ bool nvme_mdev_vsq_get_cmd(struct nvme_mdev_vctrl *vctrl, struct nvme_vsq *q,
 			   struct nvme_command *cmd);
 
 void nvme_mdev_vsq_cmd_done_io(struct nvme_mdev_vctrl *vctrl,
-			       u16 sqid, u16 cid, u16 status);
+			       u16 sqid, u16 cid, u16 status, __le64 result);
 void nvme_mdev_vsq_cmd_done_adm(struct nvme_mdev_vctrl *vctrl,
-				u32 dw0, u16 cid, u16 status);
+				__le64 result, u16 cid, u16 status);
 bool nvme_mdev_vsq_suspend_io(struct nvme_mdev_vctrl *vctrl, u16 sqid);
 
 /* udata.c*/
@@ -627,18 +519,16 @@ void nvme_mdev_udata_iter_setup(struct nvme_mdev_viommu *viommu,
 int nvme_mdev_udata_iter_set_dptr(struct nvme_ext_data_iter *it,
 				  const union nvme_data_ptr *dptr, u64 size);
 
-struct nvme_ext_data_iter *
-nvme_mdev_kdata_iter_alloc(struct nvme_mdev_viommu *viommu, unsigned int size);
-
-int nvme_mdev_read_from_udata(void *dst, struct nvme_ext_data_iter *srcit,
-			      u64 size);
-
-int nvme_mdev_write_to_udata(struct nvme_ext_data_iter *dstit, void *src,
-			     u64 size);
-
 void *nvme_mdev_udata_queue_vmap(struct nvme_mdev_viommu *viommu,
 				 dma_addr_t iova,
 				 unsigned int size, bool cont);
+
+u16 nvme_mdev_udata_map_sg(struct nvme_mdev_viommu *viommu,
+			   const struct nvme_command *cmd, u32 len,
+			   struct sg_table *sgt, struct scatterlist *inline_sg,
+			   unsigned int inline_nents);
+void nvme_mdev_udata_unmap_sg(struct sg_table *sgt,
+			      struct scatterlist *inline_sg);
 /* viommu.c */
 void nvme_mdev_viommu_init(struct nvme_mdev_viommu *viommu,
 			   struct vfio_device *vdev);
@@ -699,33 +589,6 @@ void nvme_mdev_viommu_reset(struct nvme_mdev_viommu *viommu);
 #define dev_to_vctrl(dev) \
 	((struct nvme_mdev_vctrl *)dev_get_drvdata(dev))
 
-#define RSRV_NSID (BIT(1))
-#define RSRV_DW23 (BIT(2) | BIT(3))
-#define RSRV_MPTR (BIT(4) | BIT(5))
-
-#define RSRV_DPTR (BIT(6) | BIT(7) | BIT(8) | BIT(9))
-#define RSRV_DPTR_PRP2 (BIT(8) | BIT(9))
-
-#define RSRV_DW10_15 (BIT(10) | BIT(11) | BIT(12) | BIT(13) | BIT(14) | BIT(15))
-#define RSRV_DW11_15 (BIT(11) | BIT(12) | BIT(13) | BIT(14) | BIT(15))
-#define RSRV_DW12_15 (BIT(12) | BIT(13) | BIT(14) | BIT(15))
-#define RSRV_DW13_15 (BIT(13) | BIT(14) | BIT(15))
-#define RSRV_DW14_15 (BIT(14) | BIT(15))
-
-static inline bool check_reserved_dwords(const u32 *dwords,
-					 int count, unsigned long bitmask)
-{
-	int bit;
-
-	if (WARN_ON(count > BITS_PER_TYPE(long)))
-		return false;
-
-	for_each_set_bit(bit, &bitmask, count)
-		if (dwords[bit])
-			return false;
-	return true;
-}
-
 static inline bool check_range(u64 start, u64 size, u64 end)
 {
 	u64 test = start + size;
@@ -771,24 +634,6 @@ static inline int nvme_mdev_translate_error(int error)
 		/*Shouldn't happen */
 		WARN_ON_ONCE(true);
 		return NVME_SC_INTERNAL;
-	}
-}
-
-static inline int nvme_mdev_translate_error_block(blk_status_t blk_sts)
-{
-	switch (blk_sts) {
-	case BLK_STS_OK:
-		return NVME_SC_SUCCESS;
-	case BLK_STS_NOSPC:
-		return DNR(NVME_SC_CAP_EXCEEDED);
-	case BLK_STS_TARGET:
-		return DNR(NVME_SC_LBA_RANGE);
-	case BLK_STS_NOTSUPP:
-		return DNR(NVME_SC_INVALID_OPCODE);
-	case BLK_STS_MEDIUM:
-		return DNR(NVME_SC_ACCESS_DENIED);
-	default:
-		return DNR(NVME_SC_INTERNAL);
 	}
 }
 

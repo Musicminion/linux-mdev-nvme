@@ -15,17 +15,6 @@ bool nvme_mdev_vctrl_is_dead(struct nvme_mdev_vctrl *vctrl)
 	return (vctrl->mmio.csts & (NVME_CSTS_CFS | NVME_CSTS_SHST_MASK)) != 0;
 }
 
-/* Setup the controller guid and serial */
-static void nvme_mdev_vctrl_init_id(struct nvme_mdev_vctrl *vctrl)
-{
-	const guid_t *guid = &vctrl->mdev->uuid;
-
-	snprintf(vctrl->subnqn, sizeof(vctrl->subnqn),
-		 "nqn.2014-08.org.nvmexpress:uuid:%pUl", guid->b);
-
-	snprintf(vctrl->serial, sizeof(vctrl->serial), "%pUl", guid->b);
-}
-
 /* Change the status of support for shadow doorbell */
 int nvme_mdev_vctrl_set_shadow_doorbell_supported(struct nvme_mdev_vctrl *vctrl,
 						  bool enable)
@@ -63,15 +52,13 @@ static void nvme_mdev_vctrl_viommu_update(struct nvme_mdev_vctrl *vctrl)
  */
 int nvme_mdev_vctrl_create(struct nvme_mdev_vctrl *vctrl,
 			   struct mdev_device *mdev,
-			   struct nvme_mdev_hctrl *hctrl,
-			   unsigned int max_host_queues)
+			   struct nvme_mdev_hctrl *hctrl)
 {
 	int ret;
 
 	/* Basic init */
 	vctrl->hctrl = hctrl;
 	vctrl->mdev = mdev;
-	vctrl->max_host_hw_queues = max_host_queues;
 	vctrl->viommu.vctrl = vctrl;
 	xa_init(&vctrl->viommu.chunks);
 	spin_lock_init(&vctrl->viommu.unmap_lock);
@@ -79,9 +66,7 @@ int nvme_mdev_vctrl_create(struct nvme_mdev_vctrl *vctrl,
 	mutex_init(&vctrl->lock);
 	init_waitqueue_head(&vctrl->io_pause_wq);
 	INIT_LIST_HEAD(&vctrl->link);
-	INIT_LIST_HEAD(&vctrl->host_hw_queues);
-	INIT_WORK(&vctrl->ns_gc_work, nvme_mdev_vns_gc_work);
-	nvme_mdev_vctrl_init_id(vctrl);
+	nvme_mdev_nvmet_vctrl_init(vctrl);
 
 	/* default feature values*/
 	vctrl->arb_burst_shift = 3;
@@ -100,7 +85,7 @@ int nvme_mdev_vctrl_create(struct nvme_mdev_vctrl *vctrl,
 
 	nvme_mdev_hctrl_get(hctrl);
 	vctrl->created = true;
-	_INFO(vctrl, "device created using %d host queues\n", max_host_queues);
+	_INFO(vctrl, "device created\n");
 	return 0;
 error2:
 	nvme_mdev_pci_free(vctrl);
@@ -124,17 +109,13 @@ void nvme_mdev_vctrl_destroy(struct nvme_mdev_vctrl *vctrl)
 
 	mutex_lock(&vctrl->lock);
 	nvme_mdev_io_free(vctrl);
-	nvme_mdev_vns_destroy_all(vctrl);
-	mutex_unlock(&vctrl->lock);
-
-	/* no more host block devices: nothing can queue the gc work now */
-	cancel_work_sync(&vctrl->ns_gc_work);
-
-	mutex_lock(&vctrl->lock);
 	__nvme_mdev_vctrl_reset(vctrl, true);
+	nvme_mdev_nvmet_ctrl_destroy(vctrl);
 	nvme_mdev_pci_free(vctrl);
 	nvme_mdev_mmio_free(vctrl);
 	mutex_unlock(&vctrl->lock);
+
+	nvme_mdev_nvmet_vctrl_cleanup(vctrl);
 
 	xa_destroy(&vctrl->viommu.chunks);
 	nvme_mdev_hctrl_put(vctrl->hctrl);
@@ -205,10 +186,17 @@ int nvme_mdev_vctrl_open(struct nvme_mdev_vctrl *vctrl)
 
 	nvme_mdev_viommu_init(&vctrl->viommu, &vctrl->vdev);
 
-	/* in the context of the process opening the device, see there */
-	ret = nvme_mdev_io_create(vctrl);
+	/* the nvmet controller that executes our commands */
+	ret = nvme_mdev_nvmet_ctrl_create(vctrl);
 	if (ret)
 		goto out;
+
+	/* in the context of the process opening the device, see there */
+	ret = nvme_mdev_io_create(vctrl);
+	if (ret) {
+		nvme_mdev_nvmet_ctrl_destroy(vctrl);
+		goto out;
+	}
 
 	nvme_mdev_mmio_open(vctrl);
 	vctrl->inuse = true;
@@ -231,6 +219,7 @@ void nvme_mdev_vctrl_release(struct nvme_mdev_vctrl *vctrl)
 	 * before the guest memory is unpinned below.
 	 */
 	__nvme_mdev_vctrl_reset(vctrl, false);
+	nvme_mdev_nvmet_ctrl_destroy(vctrl);
 	nvme_mdev_irqs_reset(vctrl);
 
 	/* Remove the guest DMA mappings - new user that will open the
@@ -239,8 +228,6 @@ void nvme_mdev_vctrl_release(struct nvme_mdev_vctrl *vctrl)
 	nvme_mdev_viommu_reset(&vctrl->viommu);
 	vctrl->inuse = false;
 	mutex_unlock(&vctrl->lock);
-
-	WARN_ON(!list_empty(&vctrl->host_hw_queues));
 
 	_INFO(vctrl, "device is released\n");
 }
@@ -278,19 +265,22 @@ bool nvme_mdev_vctrl_enable(struct nvme_mdev_vctrl *vctrl,
 	if (sqentries > 4096 || sqentries < 2)
 		return false;
 
+	/* nvmet checks CC and gets ready */
+	if (nvme_mdev_nvmet_enable(vctrl))
+		return false;
+
 	ret = nvme_mdev_mmio_enable_dbs(vctrl);
 	if (ret)
 		goto error0;
 
-	ret = nvme_mdev_vcq_init(vctrl, 0, cqiova, true, cqentries, 0);
-	if (ret)
+	if (nvme_mdev_nvmet_create_cq(vctrl, 0, NVME_QUEUE_PHYS_CONTIG |
+				      NVME_CQ_IRQ_ENABLED, cqentries - 1,
+				      cqiova, 0))
 		goto error1;
 
-	ret = nvme_mdev_vsq_init(vctrl, 0, sqiova, true, sqentries, 0);
-	if (ret)
+	if (nvme_mdev_nvmet_create_sq(vctrl, 0, 0, NVME_QUEUE_PHYS_CONTIG,
+				      sqentries - 1, sqiova))
 		goto error2;
-
-	nvme_mdev_events_init(vctrl);
 
 	if (!vctrl->mmio.shadow_db_supported) {
 		/* start polling right away to support admin queue */
@@ -300,10 +290,11 @@ bool nvme_mdev_vctrl_enable(struct nvme_mdev_vctrl *vctrl,
 
 	return true;
 error2:
-	nvme_mdev_mmio_disable_dbs(vctrl);
+	nvme_mdev_nvmet_delete_cq(vctrl, 0);
 error1:
-	nvme_mdev_vcq_delete(vctrl, 0);
+	nvme_mdev_mmio_disable_dbs(vctrl);
 error0:
+	nvme_mdev_nvmet_disable(vctrl);
 	return false;
 }
 
@@ -316,21 +307,19 @@ void nvme_mdev_vctrl_disable(struct nvme_mdev_vctrl *vctrl)
 
 	lockdep_assert_held(&vctrl->lock);
 
-	nvme_mdev_events_reset(vctrl);
-	nvme_mdev_vns_log_reset(vctrl);
-
 	sqid = 1;
 	for_each_set_bit_from(sqid, vctrl->vsq_en, MAX_VIRTUAL_QUEUES)
-		nvme_mdev_vsq_delete(vctrl, sqid);
+		nvme_mdev_nvmet_delete_sq(vctrl, sqid);
 
 	cqid = 1;
 	for_each_set_bit_from(cqid, vctrl->vcq_en, MAX_VIRTUAL_QUEUES)
-		nvme_mdev_vcq_delete(vctrl, cqid);
+		nvme_mdev_nvmet_delete_cq(vctrl, cqid);
 
-	nvme_mdev_vsq_delete(vctrl, 0);
-	nvme_mdev_vcq_delete(vctrl, 0);
+	nvme_mdev_nvmet_delete_sq(vctrl, 0);
+	nvme_mdev_nvmet_delete_cq(vctrl, 0);
 
 	nvme_mdev_mmio_disable_dbs(vctrl);
+	nvme_mdev_nvmet_disable(vctrl);
 	WRITE_ONCE(vctrl->io_idle, true);
 }
 
@@ -378,76 +367,6 @@ void nvme_mdev_vctrl_region_disable_mmap(struct nvme_mdev_vctrl *vctrl,
 	region->mmap_area_start = 0;
 	region->mmap_area_size = 0;
 	region->mmap_ops = NULL;
-}
-
-/* Allocate a host IO queue */
-int nvme_mdev_vctrl_hq_alloc(struct nvme_mdev_vctrl *vctrl)
-{
-	struct nvme_mdev_hq *hq = NULL, *tmp;
-	int hwqcount = 0, ret;
-
-	lockdep_assert_held(&vctrl->lock);
-
-	nvme_mdev_assert_io_not_running(vctrl);
-
-	list_for_each_entry(tmp, &vctrl->host_hw_queues, link) {
-		if (!hq || tmp->usecount < hq->usecount)
-			hq = tmp;
-		hwqcount++;
-	}
-
-	if (hwqcount < vctrl->max_host_hw_queues) {
-		ret = nvme_mdev_hctrl_hq_alloc(vctrl->hctrl);
-		if (ret < 0)
-			return ret;
-
-		hq = kzalloc_node(sizeof(*hq), GFP_KERNEL, vctrl->hctrl->node);
-		if (!hq) {
-			nvme_mdev_hctrl_hq_free(vctrl->hctrl, ret);
-			return -ENOMEM;
-		}
-
-		hq->hqid = ret;
-		hq->usecount = 1;
-		list_add_tail(&hq->link, &vctrl->host_hw_queues);
-	} else {
-		hq->usecount++;
-	}
-	return hq->hqid;
-}
-
-/* Free a host IO queue */
-void nvme_mdev_vctrl_hq_free(struct nvme_mdev_vctrl *vctrl, u16 hqid)
-{
-	struct nvme_mdev_hq *hq;
-
-	lockdep_assert_held(&vctrl->lock);
-	nvme_mdev_assert_io_not_running(vctrl);
-
-	list_for_each_entry(hq, &vctrl->host_hw_queues, link)
-		if (hq->hqid == hqid) {
-			if (--hq->usecount > 0)
-				return;
-			nvme_mdev_hctrl_hq_free(vctrl->hctrl, hq->hqid);
-			list_del(&hq->link);
-			kfree(hq);
-			return;
-		}
-	WARN_ON(1);
-}
-
-/* get current list of host queues */
-unsigned int nvme_mdev_vctrl_hqs_list(struct nvme_mdev_vctrl *vctrl, u16 *out)
-{
-	struct nvme_mdev_hq *q;
-	unsigned int i = 0;
-
-	list_for_each_entry(q, &vctrl->host_hw_queues, link) {
-		out[i++] = q->hqid;
-		if (WARN_ON(i > MAX_HOST_QUEUES))
-			break;
-	}
-	return i;
 }
 
 /*

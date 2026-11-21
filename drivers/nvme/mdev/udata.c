@@ -9,6 +9,7 @@
 #include <linux/highmem.h>
 #include <linux/vmalloc.h>
 #include <linux/slab.h>
+#include <linux/scatterlist.h>
 #include <linux/mdev.h>
 #include <linux/nvme.h>
 #include "priv.h"
@@ -168,111 +169,6 @@ int nvme_mdev_udata_iter_set_dptr(struct nvme_ext_data_iter *it,
 	return 0;
 }
 
-/* ->next function when iterator points to kernel memory buffer */
-static int nvme_mdev_kdata_iter_next(struct nvme_ext_data_iter *it)
-{
-	if (WARN_ON(it->count <= 0))
-		return 0;
-
-	if (--it->count == 0)
-		return 0;
-
-	it->physical = PAGE_ADDRESS(it->physical) + PAGE_SIZE;
-	it->host_iova = PAGE_ADDRESS(it->host_iova) + PAGE_SIZE;
-	return 0;
-}
-
-/* ->release function for kdata iterator to free it after use */
-static void nvme_mdev_kdata_iter_free(struct nvme_ext_data_iter *it)
-{
-	kfree(it->kmem.data);
-	kfree(it);
-}
-
-/* allocate a kernel data buffer with read iterator for nvme host device */
-struct nvme_ext_data_iter *
-nvme_mdev_kdata_iter_alloc(struct nvme_mdev_viommu *viommu, unsigned int size)
-{
-	struct nvme_ext_data_iter *it;
-
-	it = kzalloc(sizeof(*it), GFP_KERNEL);
-	if (!it)
-		return NULL;
-
-	it->viommu = viommu;
-	it->kmem.size = size;
-	it->kmem.data = kzalloc(size, GFP_KERNEL);
-	it->kmem.dma_addr = 0;
-
-	if (!it->kmem.data) {
-		kfree(it);
-		return NULL;
-	}
-
-	it->physical = virt_to_phys(it->kmem.data);
-	it->host_iova = it->kmem.dma_addr;
-
-	it->count = DIV_ROUND_UP(size + OFFSET_IN_PAGE(it->physical),
-				 PAGE_SIZE);
-
-	it->next = nvme_mdev_kdata_iter_next;
-	it->release = nvme_mdev_kdata_iter_free;
-	return it;
-}
-
-/* copy data from user data iterator to a kernel buffer */
-int nvme_mdev_read_from_udata(void *dst, struct nvme_ext_data_iter *srcit,
-			      u64 size)
-{
-	int ret;
-	unsigned int srcoffset, chunk_size;
-
-	while (srcit->count && size > 0) {
-		struct page *page = pfn_to_page(PHYS_PFN(srcit->physical));
-		void *src = kmap_local_page(page);
-
-		srcoffset = OFFSET_IN_PAGE(srcit->physical);
-		chunk_size = min(size, (u64)PAGE_SIZE - srcoffset);
-
-		memcpy(dst, src + srcoffset, chunk_size);
-		dst += chunk_size;
-		size -= chunk_size;
-		kunmap_local(src);
-
-		ret = srcit->next(srcit);
-		if (ret)
-			return ret;
-	}
-	WARN_ON(size > 0);
-	return 0;
-}
-
-/* copy data from kernel buffer to user data iterator */
-int nvme_mdev_write_to_udata(struct nvme_ext_data_iter *dstit, void *src,
-			     u64 size)
-{
-	int ret, dstoffset, chunk_size;
-
-	while (dstit->count && size > 0) {
-		struct page *page = pfn_to_page(PHYS_PFN(dstit->physical));
-		void *dst = kmap_local_page(page);
-
-		dstoffset = OFFSET_IN_PAGE(dstit->physical);
-		chunk_size = min(size, (u64)PAGE_SIZE - dstoffset);
-
-		memcpy(dst + dstoffset, src, chunk_size);
-		src += chunk_size;
-		size -= chunk_size;
-		kunmap_local(dst);
-
-		ret = dstit->next(dstit);
-		if (ret)
-			return ret;
-	}
-	WARN_ON(size > 0);
-	return 0;
-}
-
 /* Set prp list iterator to point to prp list found in create queue command */
 static int
 nvme_mdev_udata_iter_set_queue_prplist(struct nvme_mdev_viommu *viommu,
@@ -370,4 +266,278 @@ void *nvme_mdev_udata_queue_vmap(struct nvme_mdev_viommu *viommu,
 out:
 	kfree(pages);
 	return map;
+}
+
+/* ------------------------------------------------------------------ */
+/* command data as a scatterlist of the guest's pages, for nvmet */
+
+/* SGL data block descriptors per command, at most */
+#define NVME_MDEV_MAX_SGL_DESCS		256
+
+struct nvme_mdev_sgl_block {
+	u64 addr;
+	u32 len;
+};
+
+static int nvme_mdev_sgt_alloc(struct sg_table *sgt, unsigned int nents,
+			       struct scatterlist *inline_sg,
+			       unsigned int inline_nents)
+{
+	if (nents <= inline_nents) {
+		sg_init_table(inline_sg, nents);
+		sgt->sgl = inline_sg;
+		sgt->nents = nents;
+		sgt->orig_nents = nents;
+		return 0;
+	}
+	return sg_alloc_table(sgt, nents, GFP_KERNEL);
+}
+
+void nvme_mdev_udata_unmap_sg(struct sg_table *sgt,
+			      struct scatterlist *inline_sg)
+{
+	if (sgt->sgl && sgt->sgl != inline_sg)
+		sg_free_table(sgt);
+	sgt->sgl = NULL;
+}
+
+/* The pages of the data buffer a PRP pair (and list) describes */
+static u16 nvme_mdev_udata_map_prps(struct nvme_mdev_viommu *viommu,
+				    const union nvme_data_ptr *dptr, u32 len,
+				    struct sg_table *sgt,
+				    struct scatterlist *inline_sg,
+				    unsigned int inline_nents)
+{
+	struct nvme_ext_data_iter it;
+	struct scatterlist *sg;
+	unsigned int nents, i;
+	int ret;
+
+	nvme_mdev_udata_iter_setup(viommu, &it);
+	ret = nvme_mdev_udata_iter_set_dptr(&it, dptr, len);
+	if (ret)
+		return nvme_mdev_translate_error(ret);
+
+	nents = it.count;
+	if (nvme_mdev_sgt_alloc(sgt, nents, inline_sg, inline_nents))
+		return NVME_SC_INTERNAL;
+
+	for_each_sg(sgt->sgl, sg, nents, i) {
+		unsigned int offset = OFFSET_IN_PAGE(it.physical);
+		unsigned int seg = min_t(u32, len, PAGE_SIZE - offset);
+
+		sg_set_page(sg, pfn_to_page(PHYS_PFN(it.physical)), seg,
+			    offset);
+		len -= seg;
+
+		ret = it.next(&it);
+		if (ret) {
+			nvme_mdev_udata_unmap_sg(sgt, inline_sg);
+			return nvme_mdev_translate_error(ret);
+		}
+	}
+	WARN_ON_ONCE(len);
+	return NVME_SC_SUCCESS;
+}
+
+/* Copy @len bytes of guest memory at @iova (an SGL segment) */
+static int nvme_mdev_udata_read(struct nvme_mdev_viommu *viommu,
+				dma_addr_t iova, void *buf, unsigned int len)
+{
+	while (len) {
+		unsigned int offset = OFFSET_IN_PAGE(iova);
+		unsigned int chunk = min_t(unsigned int, len,
+					   PAGE_SIZE - offset);
+		dma_addr_t physical, host_iova;
+		void *src;
+		int ret;
+
+		ret = nvme_mdev_viommu_translate(viommu, PAGE_ADDRESS(iova),
+						 &physical, &host_iova);
+		if (ret)
+			return ret;
+
+		src = kmap_local_page(pfn_to_page(PHYS_PFN(physical)));
+		memcpy(buf, src + offset, chunk);
+		kunmap_local(src);
+
+		buf += chunk;
+		iova += chunk;
+		len -= chunk;
+	}
+	return 0;
+}
+
+static u16 nvme_mdev_sgl_add_block(struct nvme_mdev_sgl_block *blocks,
+				   unsigned int *nr,
+				   const struct nvme_sgl_desc *desc)
+{
+	u32 len = le32_to_cpu(desc->length);
+
+	if (desc->type != (NVME_SGL_FMT_DATA_DESC << 4))
+		return NVME_SC_SGL_INVALID_TYPE | NVME_STATUS_DNR;
+	if (!len)
+		return NVME_SC_SUCCESS;
+	if (*nr == NVME_MDEV_MAX_SGL_DESCS)
+		return NVME_SC_SGL_INVALID_COUNT | NVME_STATUS_DNR;
+
+	blocks[*nr].addr = le64_to_cpu(desc->addr);
+	blocks[*nr].len = len;
+	(*nr)++;
+	return NVME_SC_SUCCESS;
+}
+
+/*
+ * The data blocks an SGL describes: one data block descriptor in the
+ * command, or a chain of segments (each one's last descriptor may point
+ * to the next, unless it is the last segment).  No bit buckets, no keyed
+ * descriptors.
+ */
+static u16 nvme_mdev_udata_parse_sgl(struct nvme_mdev_viommu *viommu,
+				     const struct nvme_sgl_desc *sgl,
+				     struct nvme_mdev_sgl_block *blocks,
+				     unsigned int *nr)
+{
+	struct nvme_sgl_desc seg = *sgl, *descs;
+	u16 status = NVME_SC_SUCCESS;
+
+	*nr = 0;
+	if (seg.type == (NVME_SGL_FMT_DATA_DESC << 4))
+		return nvme_mdev_sgl_add_block(blocks, nr, &seg);
+
+	descs = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!descs)
+		return NVME_SC_INTERNAL;
+
+	for (;;) {
+		u32 seglen = le32_to_cpu(seg.length);
+		bool last = seg.type == (NVME_SGL_FMT_LAST_SEG_DESC << 4);
+		unsigned int n, i;
+
+		if (!last && seg.type != (NVME_SGL_FMT_SEG_DESC << 4)) {
+			status = NVME_SC_SGL_INVALID_TYPE | NVME_STATUS_DNR;
+			break;
+		}
+		if (!seglen || seglen % sizeof(*descs) || seglen > PAGE_SIZE) {
+			status = NVME_SC_SGL_INVALID_DATA | NVME_STATUS_DNR;
+			break;
+		}
+		n = seglen / sizeof(*descs);
+
+		if (nvme_mdev_udata_read(viommu, le64_to_cpu(seg.addr), descs,
+					 seglen)) {
+			status = NVME_SC_DATA_XFER_ERROR | NVME_STATUS_DNR;
+			break;
+		}
+
+		for (i = 0; i < n - 1 && !status; i++)
+			status = nvme_mdev_sgl_add_block(blocks, nr, &descs[i]);
+		if (status)
+			break;
+
+		/* the last one: data, or (if allowed) the next segment */
+		if (descs[n - 1].type == (NVME_SGL_FMT_DATA_DESC << 4)) {
+			status = nvme_mdev_sgl_add_block(blocks, nr,
+							 &descs[n - 1]);
+			break;
+		}
+		if (last) {
+			status = NVME_SC_SGL_INVALID_LAST | NVME_STATUS_DNR;
+			break;
+		}
+		seg = descs[n - 1];
+	}
+
+	kfree(descs);
+	return status;
+}
+
+static u16 nvme_mdev_udata_map_sgl(struct nvme_mdev_viommu *viommu,
+				   const struct nvme_sgl_desc *sgl, u32 len,
+				   struct sg_table *sgt,
+				   struct scatterlist *inline_sg,
+				   unsigned int inline_nents)
+{
+	struct nvme_mdev_sgl_block *blocks;
+	unsigned int nr, nents = 0, i;
+	struct scatterlist *sg;
+	u64 total = 0;
+	u16 status;
+
+	blocks = kvmalloc_array(NVME_MDEV_MAX_SGL_DESCS, sizeof(*blocks),
+				GFP_KERNEL);
+	if (!blocks)
+		return NVME_SC_INTERNAL;
+
+	status = nvme_mdev_udata_parse_sgl(viommu, sgl, blocks, &nr);
+	if (status)
+		goto out;
+
+	for (i = 0; i < nr; i++) {
+		total += blocks[i].len;
+		nents += DIV_ROUND_UP(OFFSET_IN_PAGE(blocks[i].addr) +
+				      blocks[i].len, PAGE_SIZE);
+	}
+
+	/* the blocks must describe exactly the data the command transfers */
+	if (total != len) {
+		status = NVME_SC_SGL_INVALID_DATA | NVME_STATUS_DNR;
+		goto out;
+	}
+
+	if (nvme_mdev_sgt_alloc(sgt, nents, inline_sg, inline_nents)) {
+		status = NVME_SC_INTERNAL;
+		goto out;
+	}
+
+	/* one entry per guest page: they need not be contiguous on the host */
+	sg = sgt->sgl;
+	for (i = 0; i < nr; i++) {
+		u64 addr = blocks[i].addr;
+		u32 left = blocks[i].len;
+
+		while (left) {
+			unsigned int offset = OFFSET_IN_PAGE(addr);
+			unsigned int seg = min_t(u32, left, PAGE_SIZE - offset);
+			dma_addr_t physical, host_iova;
+			int ret;
+
+			ret = nvme_mdev_viommu_translate(viommu,
+							 PAGE_ADDRESS(addr),
+							 &physical, &host_iova);
+			if (ret) {
+				nvme_mdev_udata_unmap_sg(sgt, inline_sg);
+				status = NVME_SC_DATA_XFER_ERROR |
+					 NVME_STATUS_DNR;
+				goto out;
+			}
+			sg_set_page(sg, pfn_to_page(PHYS_PFN(physical)), seg,
+				    offset);
+			sg = sg_next(sg);
+			addr += seg;
+			left -= seg;
+		}
+	}
+out:
+	kvfree(blocks);
+	return status;
+}
+
+/*
+ * Build the scatterlist of the guest pages that hold the @len bytes of a
+ * command's data (PRPs or SGL data blocks).  The pages stay pinned until
+ * the VFIO dma_unmap callback, which waits for the commands in flight
+ * (nvme_mdev_io_pause()).  Returns an NVMe status.
+ */
+u16 nvme_mdev_udata_map_sg(struct nvme_mdev_viommu *viommu,
+			   const struct nvme_command *cmd, u32 len,
+			   struct sg_table *sgt, struct scatterlist *inline_sg,
+			   unsigned int inline_nents)
+{
+	if (cmd->common.flags & NVME_CMD_SGL_ALL)
+		return nvme_mdev_udata_map_sgl(viommu, &cmd->common.dptr.sgl,
+					       len, sgt, inline_sg,
+					       inline_nents);
+	return nvme_mdev_udata_map_prps(viommu, &cmd->common.dptr, len, sgt,
+					inline_sg, inline_nents);
 }

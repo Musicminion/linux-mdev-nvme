@@ -31,14 +31,12 @@ static int nvme_mdev_ops_init(struct vfio_device *vdev)
 {
 	struct nvme_mdev_vctrl *vctrl = vdev_to_vctrl(vdev);
 	struct mdev_device *mdev = to_mdev_device(vdev->dev);
-	struct nvme_mdev_inst_type *type =
-		container_of(mdev->type, struct nvme_mdev_inst_type, type);
 	struct nvme_mdev_hctrl *hctrl =
 		container_of(mdev->type->parent, struct nvme_mdev_hctrl,
 			     mparent);
 	int ret;
 
-	ret = nvme_mdev_vctrl_create(vctrl, mdev, hctrl, type->max_hw_queues);
+	ret = nvme_mdev_vctrl_create(vctrl, mdev, hctrl);
 	if (ret)
 		return ret;
 
@@ -546,64 +544,98 @@ static void nvme_mdev_ops_request(struct vfio_device *vdev, unsigned int count)
 }
 
 /*
- * Add a namespace backed by a host block device, e.g.
- * "echo /dev/nvme0n1p5 > namespaces/add_namespace"
+ * The nvmet port (its number in configfs, nvmet/ports/<id>, of type "pci")
+ * and subsystem whose namespaces the guest gets.  Used when the device is
+ * opened.
  */
-static ssize_t add_namespace_store(struct device *dev,
-				   struct device_attribute *attr,
-				   const char *buf, size_t count)
+static ssize_t portid_store(struct device *dev, struct device_attribute *attr,
+			    const char *buf, size_t count)
 {
 	struct nvme_mdev_vctrl *vctrl = dev_to_vctrl(dev);
-	char *path;
+	u16 portid;
 	int ret;
 
 	if (!vctrl)
 		return -ENODEV;
+	ret = kstrtou16(buf, 0, &portid);
+	if (ret)
+		return ret;
 
-	path = kstrdup(buf, GFP_KERNEL);
-	if (!path)
-		return -ENOMEM;
-
-	ret = nvme_mdev_vns_open(vctrl, strim(path));
-	kfree(path);
-	return ret ? ret : count;
+	mutex_lock(&vctrl->lock);
+	if (vctrl->inuse) {
+		ret = -EBUSY;
+	} else {
+		vctrl->portid = portid;
+		ret = count;
+	}
+	mutex_unlock(&vctrl->lock);
+	return ret;
 }
-static DEVICE_ATTR_WO(add_namespace);
 
-/* Remove a user namespace */
-static ssize_t remove_namespace_store(struct device *dev,
-				      struct device_attribute *attr,
-				      const char *buf, size_t count)
+static ssize_t portid_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
 {
-	unsigned long user_nsid;
+	struct nvme_mdev_vctrl *vctrl = dev_to_vctrl(dev);
+
+	if (!vctrl)
+		return -ENODEV;
+	return sysfs_emit(buf, "%u\n", READ_ONCE(vctrl->portid));
+}
+static DEVICE_ATTR_RW(portid);
+
+static ssize_t subsysnqn_store(struct device *dev,
+			       struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct nvme_mdev_vctrl *vctrl = dev_to_vctrl(dev);
+	size_t len = count;
 	int ret;
-	struct nvme_mdev_vctrl *vctrl = dev_to_vctrl(dev);
 
 	if (!vctrl)
 		return -ENODEV;
+	if (len && buf[len - 1] == '\n')
+		len--;
+	if (len >= NVMF_NQN_SIZE)
+		return -EINVAL;
 
-	ret = kstrtoul(buf, 10, &user_nsid);
-	if (ret)
-		return ret;
-
-	ret =  nvme_mdev_vns_destroy(vctrl, user_nsid);
-	if (ret)
-		return ret;
-	return count;
+	mutex_lock(&vctrl->lock);
+	if (vctrl->inuse) {
+		ret = -EBUSY;
+	} else {
+		memcpy(vctrl->subsysnqn, buf, len);
+		vctrl->subsysnqn[len] = '\0';
+		ret = count;
+	}
+	mutex_unlock(&vctrl->lock);
+	return ret;
 }
-static DEVICE_ATTR_WO(remove_namespace);
 
-/* Show list of user namespaces */
-static ssize_t namespaces_show(struct device *dev,
-			       struct device_attribute *attr, char *buf)
+static ssize_t subsysnqn_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct nvme_mdev_vctrl *vctrl = dev_to_vctrl(dev);
+	ssize_t ret;
+
+	if (!vctrl)
+		return -ENODEV;
+	mutex_lock(&vctrl->lock);
+	ret = sysfs_emit(buf, "%s\n", vctrl->subsysnqn);
+	mutex_unlock(&vctrl->lock);
+	return ret;
+}
+static DEVICE_ATTR_RW(subsysnqn);
+
+/* the host NQN the instance's nvmet controllers have (from its UUID) */
+static ssize_t hostnqn_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
 {
 	struct nvme_mdev_vctrl *vctrl = dev_to_vctrl(dev);
 
 	if (!vctrl)
 		return -ENODEV;
-	return nvme_mdev_vns_print_description(vctrl, buf, PAGE_SIZE - 1);
+	return sysfs_emit(buf, "%s\n", vctrl->hostnqn);
 }
-static DEVICE_ATTR_RO(namespaces);
+static DEVICE_ATTR_RO(hostnqn);
 
 /* change the cpu binding of the IO threads*/
 static ssize_t shadow_doorbell_store(struct device *dev,
@@ -638,10 +670,10 @@ static ssize_t shadow_doorbell_show(struct device *dev,
 }
 static DEVICE_ATTR_RW(shadow_doorbell);
 
-static struct attribute *nvme_mdev_dev_ns_atttributes[] = {
-	&dev_attr_add_namespace.attr,
-	&dev_attr_remove_namespace.attr,
-	&dev_attr_namespaces.attr,
+static struct attribute *nvme_mdev_dev_nvmet_atttributes[] = {
+	&dev_attr_portid.attr,
+	&dev_attr_subsysnqn.attr,
+	&dev_attr_hostnqn.attr,
 	NULL
 };
 
@@ -683,9 +715,9 @@ static struct attribute *nvme_mdev_dev_settings_atttributes[] = {
 	NULL
 };
 
-static const struct attribute_group nvme_mdev_ns_attr_group = {
-	.name = "namespaces",
-	.attrs = nvme_mdev_dev_ns_atttributes,
+static const struct attribute_group nvme_mdev_nvmet_attr_group = {
+	.name = "nvmet",
+	.attrs = nvme_mdev_dev_nvmet_atttributes,
 };
 
 static const struct attribute_group nvme_mdev_setting_attr_group = {
@@ -694,7 +726,7 @@ static const struct attribute_group nvme_mdev_setting_attr_group = {
 };
 
 static const struct attribute_group *nvme_mdev_dev_attributte_groups[] = {
-	&nvme_mdev_ns_attr_group,
+	&nvme_mdev_nvmet_attr_group,
 	&nvme_mdev_setting_attr_group,
 	NULL,
 };

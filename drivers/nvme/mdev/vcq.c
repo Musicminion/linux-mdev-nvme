@@ -171,11 +171,10 @@ bool nvme_mdev_vcq_reserve_space(struct nvme_vcq *q)
 
 /* Write a new item into the completion queue (IO version) */
 void nvme_mdev_vcq_write_io(struct nvme_mdev_vctrl *vctrl,
-			    struct nvme_vcq *q, u16 sq_head,
+			    struct nvme_vcq *q, __le64 result, u16 sq_head,
 			    u16 sqid, u16 cid, u16 status)
 {
-	__le64 *qw = (__le64 *)(&q->data[q->tail]);
-
+	__le64 *qw;
 	u64 phase = q->phase ? (0x1ULL << 48) : 0;
 	u64 qw1 =
 		((u64)sq_head) |
@@ -183,12 +182,20 @@ void nvme_mdev_vcq_write_io(struct nvme_mdev_vctrl *vctrl,
 		((u64)cid << 32) |
 		((u64)status << 49) | phase;
 
+	/* the guest gave us a queue in unmapped memory */
+	if (unlikely(!q->data))
+		return;
+	qw = (__le64 *)(&q->data[q->tail]);
+
 	/*
-	 * Only the second qword is written: status and phase are in it, so a
-	 * single store publishes the entry.  The data the device wrote for
-	 * the command was ordered before this by the acquire load of the
-	 * request status in the I/O backend.
+	 * The command's result first, then the second qword, which holds
+	 * the status and the phase: that single store publishes the entry.
+	 * The data the backend wrote for the command was ordered before
+	 * this by taking the command off the completion list.
 	 */
+	WRITE_ONCE(qw[0], result);
+	/* the guest (a CPU) must see the result before the phase flips */
+	smp_wmb();
 	WRITE_ONCE(qw[1], cpu_to_le64(qw1));
 
 	nvme_mdev_vcq_advance_tail(q);
@@ -198,18 +205,22 @@ void nvme_mdev_vcq_write_io(struct nvme_mdev_vctrl *vctrl,
 
 /* Write a new item into the completion queue (ADMIN version) */
 void nvme_mdev_vcq_write_adm(struct nvme_mdev_vctrl *vctrl,
-			     struct nvme_vcq *q, u32 dw0,
+			     struct nvme_vcq *q, __le64 result,
 			     u16 sq_head, u16 cid, u16 status)
 {
-	__le64 *qw = (__le64 *)(&q->data[q->tail]);
-
+	__le64 *qw;
 	u64 phase = q->phase ? (0x1ULL << 48) : 0;
 	u64 qw1 =
 		((u64)sq_head) |
 		((u64)cid << 32) |
 		((u64)status << 49) | phase;
 
-	WRITE_ONCE(qw[0], cpu_to_le64(dw0));
+	/* the guest gave us a queue in unmapped memory */
+	if (unlikely(!q->data))
+		return;
+	qw = (__le64 *)(&q->data[q->tail]);
+
+	WRITE_ONCE(qw[0], result);
 	/*
 	 * The guest (a CPU, not a device) must see DW0 and any data we
 	 * copied into its buffers before the phase bit flips.

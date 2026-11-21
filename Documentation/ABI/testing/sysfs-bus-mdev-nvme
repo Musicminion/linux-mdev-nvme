@@ -3,46 +3,44 @@ Date:		November 2026
 Contact:	linux-nvme@lists.infradead.org
 Description:
 		The NVMe mediated device type: a virtual NVMe PCIe controller
-		whose I/O goes through the block layer.  While an instance
-		is open it has its own polling I/O thread, "nvme-mdev-io",
-		which is a thread of the process that opened the device
-		(e.g. QEMU): its CPU time and I/O are accounted to that
-		process and its cgroups, and it starts out with that
-		process's CPU affinity (change it with sched_setaffinity(2),
-		e.g. taskset -p).  Writing a UUID to "create" makes
-		a new instance (see sysfs-bus-vfio-mdev); at most 16 instances
-		exist at a time ("available_instances").
+		whose commands are executed by the NVMe target (nvmet), see
+		the nvmet/ attributes.  While an instance is open it has its
+		own polling I/O thread, "nvme-mdev-io", which is a thread of
+		the process that opened the device (e.g. QEMU): its CPU time
+		and I/O are accounted to that process and its cgroups, and it
+		starts out with that process's CPU affinity (change it with
+		sched_setaffinity(2), e.g. taskset -p).  Writing a UUID to
+		"create" makes a new instance (see sysfs-bus-vfio-mdev); at
+		most 16 instances exist at a time ("available_instances").
 
-What:		/sys/bus/mdev/devices/<uuid>/namespaces/add_namespace
+What:		/sys/bus/mdev/devices/<uuid>/nvmet/portid
 Date:		November 2026
 Contact:	linux-nvme@lists.infradead.org
 Description:
-		(WO) Writing the path of a host block device (e.g. an NVMe
-		namespace or a partition of one) adds it to the virtual
-		controller as the next free namespace, NSID 1 to 16.  The
-		block device is opened exclusively; it is read-only to the
-		guest if it can only be opened for reading.  The guest is
-		told with a Namespace Attribute Changed event.
-		For example::
+		(RW) The nvmet port the instance uses: the number of its
+		configfs directory, /sys/kernel/config/nvmet/ports/<portid>.
+		The port must have transport type "pci" and be enabled (a
+		subsystem linked to it).  0 by default.  Can only be changed
+		while the device is not open (-EBUSY otherwise).
 
-		  # echo /dev/nvme0n1p5 > \
-		      /sys/bus/mdev/devices/<uuid>/namespaces/add_namespace
-
-What:		/sys/bus/mdev/devices/<uuid>/namespaces/remove_namespace
+What:		/sys/bus/mdev/devices/<uuid>/nvmet/subsysnqn
 Date:		November 2026
 Contact:	linux-nvme@lists.infradead.org
 Description:
-		(WO) Writing an NSID removes that namespace from the virtual
-		controller and releases the host block device.  This also
-		happens by itself when the host block device goes away.
+		(RW) The NQN of the nvmet subsystem whose namespaces the
+		guest gets.  When the device is opened, an nvmet controller
+		is created for it on the port above; the subsystem must allow
+		the instance's host NQN (see hostnqn).  Empty by default:
+		the device can't be opened until it is set.  Can only be
+		changed while the device is not open (-EBUSY otherwise).
 
-What:		/sys/bus/mdev/devices/<uuid>/namespaces/namespaces
+What:		/sys/bus/mdev/devices/<uuid>/nvmet/hostnqn
 Date:		November 2026
 Contact:	linux-nvme@lists.infradead.org
 Description:
-		(RO) One line per namespace of the virtual controller:
-		"VNS<nsid>: <host block device>", followed by " (ro)" for
-		read-only namespaces.
+		(RO) The host NQN of the instance's nvmet controllers,
+		"nqn.2014-08.org.nvmexpress:uuid:<uuid>" (their host ID is
+		the instance's UUID too), for the subsystem's allowed_hosts.
 
 What:		/sys/bus/mdev/devices/<uuid>/settings/shadow_doorbell
 Date:		November 2026

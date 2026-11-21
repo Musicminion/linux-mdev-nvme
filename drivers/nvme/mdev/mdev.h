@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0+ */
 /*
- * NVME VFIO mediated driver - data iterator shared by the guest data
- * walker and the host IO backends
+ * NVME VFIO mediated driver - the guest data (PRP) iterator
  * Copyright (c) 2019 - Maxim Levitsky
  */
 
@@ -25,20 +24,12 @@ struct user_prplist {
 	unsigned int index;	/* index of current entry */
 };
 
-struct kernel_data {
-	/* used by kernel data iterator*/
-	void		*data;
-	unsigned int	size;
-	dma_addr_t	dma_addr;
-};
-
 struct nvme_ext_data_iter {
 	/* private */
 	struct nvme_mdev_viommu *viommu;
 	union {
 		const union nvme_data_ptr *dptr;
 		struct user_prplist uprp;
-		struct kernel_data kmem;
 	};
 
 	/* user interface */
@@ -54,12 +45,6 @@ struct nvme_ext_data_iter {
 	 * pointed by the iterator
 	 */
 	void (*release)(struct nvme_ext_data_iter *data_iter);
-};
-
-/* Completion of a passed-through command, as reported by a host queue */
-struct nvme_ext_cmd_result {
-	u32 tag;	/* (guest sq id << 16) | guest command id */
-	u16 status;	/* NVMe status field, without the phase bit */
 };
 
 #endif
