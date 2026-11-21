@@ -653,6 +653,8 @@ static void nvmet_execute_get_log_page_features(struct nvmet_req *req)
 		cpu_to_le32(NVME_FIS_FSUPP | NVME_FIS_NSCPE);
 	features->fis[NVME_FEAT_RESV_MASK] =
 		cpu_to_le32(NVME_FIS_FSUPP | NVME_FIS_NSCPE);
+	features->fis[NVME_FEAT_WRITE_ATOMIC] =
+		cpu_to_le32(NVME_FIS_FSUPP | NVME_FIS_CSCPE);
 
 	status = nvmet_copy_to_sgl(req, 0, features, sizeof(*features));
 	kfree(features);
@@ -1444,6 +1446,19 @@ void nvmet_execute_set_features(struct nvmet_req *req)
 	case NVME_FEAT_RESV_MASK:
 		status = nvmet_set_feat_resv_notif_mask(req, cdw11);
 		break;
+	case NVME_FEAT_WRITE_ATOMIC:
+		/*
+		 * Write Atomicity Normal: only Disable Normal.  AWUN is 0
+		 * (one logical block), so it doesn't change anything.
+		 */
+		if (cdw11 & ~1U) {
+			req->error_loc =
+				offsetof(struct nvme_common_command, cdw11);
+			status = NVME_SC_INVALID_FIELD | NVME_STATUS_DNR;
+			break;
+		}
+		ctrl->write_atomic_dn = cdw11 & 1;
+		break;
 	default:
 		req->error_loc = offsetof(struct nvme_common_command, cdw10);
 		status = NVME_SC_INVALID_FIELD | NVME_STATUS_DNR;
@@ -1578,9 +1593,10 @@ void nvmet_execute_get_features(struct nvmet_req *req)
 		break;
 	case NVME_FEAT_ERR_RECOVERY:
 		break;
-	case NVME_FEAT_WRITE_ATOMIC:
-		break;
 #endif
+	case NVME_FEAT_WRITE_ATOMIC:
+		nvmet_set_result(req, ctrl->write_atomic_dn);
+		break;
 	case NVME_FEAT_ARBITRATION:
 		status = nvmet_get_feat_arbitration(req);
 		break;

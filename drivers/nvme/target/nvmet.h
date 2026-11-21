@@ -269,6 +269,7 @@ struct nvmet_ctrl {
 	u16			cntlid;
 	u16			max_qid;
 	u32			kato;
+	bool			write_atomic_dn; /* Write Atomicity Normal: DN */
 
 	struct nvmet_port	*port;
 
