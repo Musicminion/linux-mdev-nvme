@@ -39,14 +39,91 @@ static bool nvme_mdev_adm_needs_processing(struct io_ctx *ctx)
 	return false;
 }
 
-/* process a user submission queue: up to a burst of commands to nvmet */
-static void nvme_mdev_io_process_sq(struct io_ctx *ctx, u16 sqid)
+/*
+ * process a user submission queue: up to a burst of commands to nvmet;
+ * returns how many
+ */
+static unsigned int nvme_mdev_io_process_sq(struct io_ctx *ctx, u16 sqid)
 {
 	unsigned int i;
 
 	for (i = 0; i < ctx->arb_burst; i++)
 		if (!nvme_mdev_nvmet_submit_io(ctx->vctrl, sqid))
 			break;
+	return i;
+}
+
+/* see vctrl->irq_mode */
+bool nvme_mdev_io_irq_mode(struct nvme_mdev_vctrl *vctrl)
+{
+	return READ_ONCE(vctrl->irq_mode) && vctrl->mmio.shadow_db_supported;
+}
+
+/*
+ * A command completed (any context, after it is on the completion list):
+ * in interrupt mode, wake the I/O thread up if it sleeps.  Under the lock,
+ * so that the thread can't go away meanwhile (nvme_mdev_io_free()).
+ */
+void nvme_mdev_io_completed(struct nvme_mdev_vctrl *vctrl)
+{
+	unsigned long flags;
+
+	if (!READ_ONCE(vctrl->irq_mode))
+		return;
+	/*
+	 * The completion's store before the io_sleeping load: pairs with
+	 * the barrier in nvme_mdev_io_wait()
+	 */
+	smp_mb();
+	if (!READ_ONCE(vctrl->io_sleeping))
+		return;
+	spin_lock_irqsave(&vctrl->wake_lock, flags);
+	if (READ_ONCE(vctrl->io_sleeping) && vctrl->iothread)
+		vhost_task_wake(vctrl->iothread);
+	spin_unlock_irqrestore(&vctrl->wake_lock, flags);
+}
+
+/* the guest has commands for us */
+static bool nvme_mdev_io_sqs_have_data(struct nvme_mdev_vctrl *vctrl)
+{
+	u16 sqid = 1;
+
+	for_each_set_bit_from(sqid, vctrl->vsq_en, MAX_VIRTUAL_QUEUES)
+		if (nvme_mdev_vsq_has_data(vctrl, &vctrl->vsqs[sqid]))
+			return true;
+	return false;
+}
+
+/*
+ * Interrupt mode, with commands in flight and nothing else to do: sleep
+ * until one completes (->queue_response wakes us up), the guest rings a
+ * doorbell (the event indexes ask for that now; the MMIO write wakes us
+ * up through nvme_mdev_io_resume()), or we are paused.
+ */
+static void nvme_mdev_io_wait(struct io_ctx *ctx)
+{
+	struct nvme_mdev_vctrl *vctrl = ctx->vctrl;
+	u16 sqid = 1;
+
+	for_each_set_bit_from(sqid, vctrl->vsq_en, MAX_VIRTUAL_QUEUES)
+		if (!nvme_mdev_vsq_suspend_io(vctrl, sqid))
+			return;		/* there are new commands already */
+
+	/* no interrupt waits for its coalescing time while we sleep */
+	nvme_mdev_irqs_flush_pending(vctrl);
+
+	WRITE_ONCE(vctrl->io_sleeping, true);
+	/*
+	 * A full barrier: a completion added after it sees io_sleeping and
+	 * wakes us (or we see it on the list); a doorbell write after it
+	 * wakes us (or we see the new tail).
+	 */
+	set_current_state(TASK_INTERRUPTIBLE);
+	if (llist_empty(&vctrl->io_done) && !READ_ONCE(vctrl->io_pause_req) &&
+	    !nvme_mdev_io_sqs_have_data(vctrl))
+		schedule();
+	__set_current_state(TASK_RUNNING);
+	WRITE_ONCE(vctrl->io_sleeping, false);
 }
 
 /* process a user completion queue */
@@ -62,6 +139,8 @@ static void nvme_mdev_io_polling_loop(struct io_ctx *ctx)
 	struct blk_plug plug;
 	u16 cqid, sqid;
 	bool idle = false;
+	bool irq_mode = nvme_mdev_io_irq_mode(vctrl);
+	unsigned int work;
 	ktime_t wait_start;
 
 	ctx->arb_burst = 1 << ctx->vctrl->arb_burst_shift;
@@ -87,21 +166,37 @@ static void nvme_mdev_io_polling_loop(struct io_ctx *ctx)
 		 * process the submission queues; plugged, so that a block
 		 * device backend gets the batch at once (->queue_rqs)
 		 */
+		work = 0;
 		blk_start_plug(&plug);
 		sqid = 1;
 		for_each_set_bit_from(sqid, vctrl->vsq_en, MAX_VIRTUAL_QUEUES)
-			nvme_mdev_io_process_sq(ctx, sqid);
+			work += nvme_mdev_io_process_sq(ctx, sqid);
 		blk_finish_plug(&plug);
 
 		/* the commands nvmet completed */
 		nvme_mdev_nvmet_poll_io(vctrl);
-		if (nvme_mdev_nvmet_reap_io(vctrl))
+		if (nvme_mdev_nvmet_reap_io(vctrl)) {
 			ctx->last_io_t = vctrl->now;
+			work++;
+		}
 
 		/* process the completions from the guest*/
 		cqid = 1;
 		for_each_set_bit_from(cqid, vctrl->vcq_en, MAX_VIRTUAL_QUEUES)
 			nvme_mdev_io_process_cq(ctx, cqid);
+
+		/*
+		 * Interrupt mode: go on while there's work; idle as soon as
+		 * nothing is in flight; else sleep until something happens
+		 */
+		if (irq_mode && !work) {
+			if (!atomic_read(&vctrl->io_inflight)) {
+				idle = true;
+				break;
+			}
+			nvme_mdev_io_wait(ctx);
+			continue;
+		}
 
 		/* Check if we need to stop polling */
 		if (ctx->idle_timeout_ms && !atomic_read(&vctrl->io_inflight) &&
@@ -131,10 +226,14 @@ static void nvme_mdev_io_polling_loop(struct io_ctx *ctx)
 		}
 	}
 
-	/* Drain all the pending completion interrupts to the guest*/
+	/*
+	 * Drain all the pending completion interrupts to the guest; while it
+	 * hasn't consumed the entries, keep polling (interrupt mode: no,
+	 * that's the point, it rings the doorbell when it has more for us)
+	 */
 	cqid = 1;
 	for_each_set_bit_from(cqid, vctrl->vcq_en, MAX_VIRTUAL_QUEUES)
-		if (nvme_mdev_vcq_flush(vctrl, cqid))
+		if (nvme_mdev_vcq_flush(vctrl, cqid) && !irq_mode)
 			idle = false;
 
 	/* Park IO thread if IO is truly idle*/
@@ -330,6 +429,9 @@ void nvme_mdev_io_free(struct nvme_mdev_vctrl *vctrl)
 
 	/* let it finish its host I/O first */
 	nvme_mdev_io_pause(vctrl);
+	/* (no completion is waking it up any more, see io_completed()) */
+	spin_lock_irq(&vctrl->wake_lock);
+	spin_unlock_irq(&vctrl->wake_lock);
 	vhost_task_stop(vctrl->iothread);
 
 	vctrl->iothread = NULL;

@@ -30,6 +30,7 @@
 #include "trace.h"
 
 static const struct nvmet_fabrics_ops nvme_mdev_nvmet_ops;
+static const struct nvmet_fabrics_ops nvme_mdev_nvmet_irq_ops;
 static struct kmem_cache *nvme_mdev_iod_cache;
 
 /* nvmet ports of our type ("pci") that are enabled */
@@ -72,8 +73,12 @@ static void nvme_mdev_nvmet_queue_response(struct nvmet_req *req)
 	/* release: the result is in, for nvme_mdev_mig_save() */
 	smp_store_release(&iod->completed, true);
 	if (iod->sqid) {
-		/* the I/O thread polls while it has commands in flight */
+		/*
+		 * The I/O thread polls while it has commands in flight, or
+		 * sleeps (interrupt mode): then wake it up.
+		 */
 		llist_add(&iod->done, &vctrl->io_done);
+		nvme_mdev_io_completed(vctrl);
 		return;
 	}
 
@@ -102,8 +107,13 @@ static void nvme_mdev_iod_start(struct nvme_mdev_iod *iod)
 	u16 status;
 	u32 len;
 
-	/* on failure nvmet already completed it (->queue_response) */
-	if (!nvmet_req_init(req, &vctrl->tsqs[iod->sqid], &nvme_mdev_nvmet_ops))
+	/*
+	 * On failure nvmet already completed it (->queue_response).  In
+	 * interrupt mode nothing polls: no polled bios.
+	 */
+	if (!nvmet_req_init(req, &vctrl->tsqs[iod->sqid],
+			    nvme_mdev_io_irq_mode(vctrl) ?
+			    &nvme_mdev_nvmet_irq_ops : &nvme_mdev_nvmet_ops))
 		return;
 
 	len = nvmet_req_transfer_len(req);
@@ -632,24 +642,31 @@ static void nvme_mdev_nvmet_delete_work(struct work_struct *work)
 	mutex_unlock(&vctrl->lock);
 }
 
-static const struct nvmet_fabrics_ops nvme_mdev_nvmet_ops = {
-	.owner		= THIS_MODULE,
-	.type		= NVMF_TRTYPE_PCI,
-	/* the I/O thread polls (nvme_mdev_nvmet_poll_io()) */
-	.flags		= NVMF_POLLED_IO,
-	.add_port	= nvme_mdev_nvmet_op_add_port,
-	.remove_port	= nvme_mdev_nvmet_op_remove_port,
-	.queue_response	= nvme_mdev_nvmet_queue_response,
-	.delete_ctrl	= nvme_mdev_nvmet_op_delete_ctrl,
-	.get_mdts	= nvme_mdev_nvmet_op_get_mdts,
-	.create_cq	= nvme_mdev_nvmet_op_create_cq,
-	.delete_cq	= nvme_mdev_nvmet_op_delete_cq,
-	.create_sq	= nvme_mdev_nvmet_op_create_sq,
-	.delete_sq	= nvme_mdev_nvmet_op_delete_sq,
-	.get_feature	= nvme_mdev_nvmet_op_get_feature,
-	.set_feature	= nvme_mdev_nvmet_op_set_feature,
-	.dbbuf_config	= nvme_mdev_nvmet_op_dbbuf_config,
-};
+#define NVME_MDEV_NVMET_OPS(_flags)					\
+{									\
+	.owner		= THIS_MODULE,					\
+	.type		= NVMF_TRTYPE_PCI,				\
+	.flags		= _flags,					\
+	.add_port	= nvme_mdev_nvmet_op_add_port,			\
+	.remove_port	= nvme_mdev_nvmet_op_remove_port,		\
+	.queue_response	= nvme_mdev_nvmet_queue_response,		\
+	.delete_ctrl	= nvme_mdev_nvmet_op_delete_ctrl,		\
+	.get_mdts	= nvme_mdev_nvmet_op_get_mdts,			\
+	.create_cq	= nvme_mdev_nvmet_op_create_cq,			\
+	.delete_cq	= nvme_mdev_nvmet_op_delete_cq,			\
+	.create_sq	= nvme_mdev_nvmet_op_create_sq,			\
+	.delete_sq	= nvme_mdev_nvmet_op_delete_sq,			\
+	.get_feature	= nvme_mdev_nvmet_op_get_feature,		\
+	.set_feature	= nvme_mdev_nvmet_op_set_feature,		\
+	.dbbuf_config	= nvme_mdev_nvmet_op_dbbuf_config,		\
+}
+
+/* the transport; the I/O thread polls (nvme_mdev_nvmet_poll_io()) */
+static const struct nvmet_fabrics_ops nvme_mdev_nvmet_ops =
+	NVME_MDEV_NVMET_OPS(NVMF_POLLED_IO);
+/* the same for the commands of instances in interrupt mode */
+static const struct nvmet_fabrics_ops nvme_mdev_nvmet_irq_ops =
+	NVME_MDEV_NVMET_OPS(0);
 
 /* ------------------------------------------------------------------ */
 /* the nvmet controller */
@@ -774,6 +791,7 @@ void nvme_mdev_nvmet_vctrl_init(struct nvme_mdev_vctrl *vctrl)
 	init_llist_head(&vctrl->io_done);
 	atomic_set(&vctrl->io_inflight, 0);
 	INIT_LIST_HEAD(&vctrl->io_list);
+	spin_lock_init(&vctrl->wake_lock);
 	INIT_LIST_HEAD(&vctrl->adm_list);
 	INIT_WORK(&vctrl->adm_done_work, nvme_mdev_nvmet_adm_done_work);
 	INIT_WORK(&vctrl->nvmet_delete_work, nvme_mdev_nvmet_delete_work);

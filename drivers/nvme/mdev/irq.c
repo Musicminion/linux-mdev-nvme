@@ -255,6 +255,19 @@ void nvme_mdev_irq_trigger(struct nvme_mdev_vctrl *vctrl,
 	}
 }
 
+/* Trigger the interrupts raised and held back for coalescing, now */
+void nvme_mdev_irqs_flush_pending(struct nvme_mdev_vctrl *vctrl)
+{
+	unsigned int i;
+
+	for (i = 0; i < MAX_VIRTUAL_IRQS; i++) {
+		if (!vctrl->irqs.vecs[i].irq_pending_cnt)
+			continue;
+		nvme_mdev_irq_trigger(vctrl, i);
+		nvme_mdev_irq_clear(vctrl, i);
+	}
+}
+
 /* Trigger previously raised interrupt */
 void nvme_mdev_irq_cond_trigger(struct nvme_mdev_vctrl *vctrl,
 				unsigned int index)
