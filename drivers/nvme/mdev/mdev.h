@@ -17,6 +17,7 @@ struct page_map {
 	void *kmap;
 	struct page *page;
 	dma_addr_t iova;
+	bool write;		/* the device writes it */
 };
 
 struct user_prplist {
@@ -35,6 +36,7 @@ struct kernel_data {
 struct nvme_ext_data_iter {
 	/* private */
 	struct nvme_mdev_viommu *viommu;
+	bool write;		/* the device writes the data pages */
 	union {
 		const union nvme_data_ptr *dptr;
 		struct user_prplist uprp;

@@ -76,8 +76,10 @@ static int nvme_mdev_io_translate_rw(struct io_ctx *ctx)
 	ctx->out.rw.slba = in->slba;
 	ctx->out.rw.length = in->length;
 
+	/* data transfer direction: opcode bit 1, controller to host */
 	ret = nvme_mdev_udata_iter_set_dptr(&ctx->udatait, &in->dptr,
-					    length << ctx->ns->blksize_shift);
+					    length << ctx->ns->blksize_shift,
+					    in->opcode & 2);
 	if (ret)
 		return nvme_mdev_translate_error(ret);
 
@@ -169,7 +171,8 @@ static int nvme_mdev_io_translate_dsm(struct io_ctx *ctx)
 	size = nr * sizeof(struct nvme_dsm_range);
 
 	ctx->out.dsm.nr = in->nr;
-	ret = nvme_mdev_udata_iter_set_dptr(&ctx->udatait, &in->dptr, size);
+	ret = nvme_mdev_udata_iter_set_dptr(&ctx->udatait, &in->dptr, size,
+					    false);
 	if (ret)
 		goto error;
 
