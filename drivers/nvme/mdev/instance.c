@@ -677,9 +677,45 @@ static ssize_t poll_timeout_ms_show(struct device *dev,
 }
 static DEVICE_ATTR_RW(poll_timeout_ms);
 
+/* interrupt mode of the I/O thread, see vctrl->irq_mode */
+static ssize_t interrupt_mode_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct nvme_mdev_vctrl *vctrl = dev_to_vctrl(dev);
+	bool val;
+	int ret;
+
+	if (!vctrl)
+		return -ENODEV;
+	ret = kstrtobool(buf, &val);
+	if (ret)
+		return ret;
+	/* (not with I/O in flight: polled bios need the polling) */
+	mutex_lock(&vctrl->lock);
+	if (vctrl->inuse)
+		ret = -EBUSY;
+	else
+		WRITE_ONCE(vctrl->irq_mode, val);
+	mutex_unlock(&vctrl->lock);
+	return ret ? ret : count;
+}
+
+static ssize_t interrupt_mode_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct nvme_mdev_vctrl *vctrl = dev_to_vctrl(dev);
+
+	if (!vctrl)
+		return -ENODEV;
+	return sysfs_emit(buf, "%d\n", READ_ONCE(vctrl->irq_mode));
+}
+static DEVICE_ATTR_RW(interrupt_mode);
+
 static struct attribute *nvme_mdev_dev_settings_atttributes[] = {
 	&dev_attr_shadow_doorbell.attr,
 	&dev_attr_poll_timeout_ms.attr,
+	&dev_attr_interrupt_mode.attr,
 	NULL
 };
 

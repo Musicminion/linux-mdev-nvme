@@ -348,6 +348,18 @@ struct nvme_mdev_vctrl {
 	bool write_atomicity_dn;	/* feature 0x0a, Disable Normal */
 	u8 worload_hint;
 	unsigned int poll_timeout_ms;	/* 0: never stop polling */
+	/*
+	 * Interrupt mode (set while the device isn't open): the I/O thread
+	 * never waits by polling, it sleeps as soon as there's nothing to do;
+	 * doorbell writes (the event indexes ask for them) and host I/O
+	 * completions wake it up.  No polled bios then.  Only with shadow
+	 * doorbells, which make the doorbell writes trap.
+	 */
+	bool irq_mode;
+	bool io_sleeping;		/* sleeping with host I/O in flight */
+	bool io_kicked;			/* host I/O completed since it looked */
+	/* completions waking the thread up vs. its end (nvme_mdev_io_free()) */
+	spinlock_t wake_lock;
 
 	/* Identification*/
 	char subnqn[256];
@@ -381,6 +393,9 @@ struct mbio {
 	/* Write Zeroes with FUA: flush once the zeroing is done */
 	bool flush_after;
 	struct block_device *bdev;
+
+	/* the controller it is for (interrupt mode wake-ups) */
+	struct nvme_mdev_vctrl *vctrl;
 
 	/* must be last for bioset allocation*/
 	struct bio bio;
@@ -498,6 +513,8 @@ int nvme_mdev_io_create(struct nvme_mdev_vctrl *vctrl);
 void nvme_mdev_io_free(struct nvme_mdev_vctrl *vctrl);
 void nvme_mdev_io_pause(struct nvme_mdev_vctrl *vctrl);
 void nvme_mdev_io_resume(struct nvme_mdev_vctrl *vctrl);
+bool nvme_mdev_io_irq_mode(struct nvme_mdev_vctrl *vctrl);
+void nvme_mdev_io_completed(struct nvme_mdev_vctrl *vctrl);
 void nvme_mdev_assert_io_not_running(struct nvme_mdev_vctrl *vctrl);
 
 /* mmio.c*/
@@ -560,6 +577,7 @@ void nvme_mdev_irq_trigger(struct nvme_mdev_vctrl *vctrl,
 			   unsigned int index);
 void nvme_mdev_irq_cond_trigger(struct nvme_mdev_vctrl *vctrl,
 				unsigned int index);
+void nvme_mdev_irqs_flush_pending(struct nvme_mdev_vctrl *vctrl);
 void nvme_mdev_irq_clear(struct nvme_mdev_vctrl *vctrl,
 			 unsigned int index);
 
