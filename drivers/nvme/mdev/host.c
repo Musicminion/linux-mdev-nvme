@@ -285,8 +285,9 @@ int nvme_mdev_hctrl_hq_submit(struct nvme_mdev_hctrl *hctrl,
 				goto error;
 			}
 
+			/* (the next PRP: the guest's, checked only now) */
 			retval = datait->next(datait);
-			if (WARN_ON(retval))
+			if (retval)
 				goto error;
 			datalength -= chunk;
 		}
