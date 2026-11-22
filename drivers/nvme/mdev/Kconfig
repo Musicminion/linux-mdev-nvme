@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config NVME_MDEV_VFIO
+	tristate "NVMe mediated VFIO virtual controller (EXPERIMENTAL)"
+	depends on BLOCK && VFIO && 64BIT
+	select VFIO_MDEV
+	help
+	  Exposes host block devices (e.g. NVMe namespaces or partitions of
+	  them) to a guest as the namespaces of a virtual NVMe PCIe
+	  controller, using a VFIO mediated device.  The guest uses its own,
+	  unmodified NVMe driver; a polling kernel thread translates the I/O
+	  commands and sends them through the block layer as polled bios
+	  (configure poll queues on the host device, e.g. nvme.poll_queues).
+
+	  If unsure, say N.
