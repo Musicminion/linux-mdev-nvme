@@ -512,6 +512,8 @@ int nvme_mdev_mmio_enable_dbs_shadow(struct nvme_mdev_vctrl *vctrl,
 
 void nvme_mdev_mmio_viommu_update(struct nvme_mdev_vctrl *vctrl);
 void nvme_mdev_mmio_disable_dbs(struct nvme_mdev_vctrl *vctrl);
+void nvme_mdev_mmio_db_invalid(struct nvme_mdev_vctrl *vctrl,
+			       u16 qid, u16 size, u16 db);
 bool nvme_mdev_mmio_db_check(struct nvme_mdev_vctrl *vctrl,
 			     u16 qid, u16 size, u16 db);
 
@@ -696,7 +698,14 @@ static inline int nvme_mdev_translate_error(int error)
 		 */
 		return DNR(NVME_SC_DATA_XFER_ERROR);
 	case -EFAULT:
-		/* Bad memory pointers in the prp lists*/
+	case -ENOENT:
+	case -EOVERFLOW:
+	case -EACCES:
+		/*
+		 * Bad memory pointers in the command or the prp lists:
+		 * nothing mapped there (-ENOENT from iommufd), a range that
+		 * wraps around, memory the device may not use
+		 */
 		return DNR(NVME_SC_DATA_XFER_ERROR);
 	case -EINVAL:
 		/* Bad prp offsets in the prp lists/command*/
@@ -710,8 +719,8 @@ static inline int nvme_mdev_translate_error(int error)
 		/* host queue (temporarily) unusable, e.g. host reset */
 		return NVME_SC_INTERNAL;
 	default:
-		/*Shouldn't happen */
-		WARN_ON_ONCE(true);
+		/* (the guest's addresses get us here: no WARN) */
+		pr_debug("nvme-mdev: unexpected error %d\n", error);
 		return NVME_SC_INTERNAL;
 	}
 }

@@ -139,9 +139,21 @@ void nvme_mdev_vcq_process(struct nvme_mdev_vctrl *vctrl, u16 qid,
 		if (!nvme_mdev_mmio_db_check(vctrl, q->qid, q->size, new_head))
 			return;
 
+		/*
+		 * The guest can only release the entries we posted, from
+		 * head to tail: a head beyond the tail is an invalid value
+		 * too.  (pending counts more: the commands in flight have
+		 * their entry reserved.)
+		 */
+		if ((new_head + q->size - q->head) % q->size >
+		    (q->tail + q->size - q->head) % q->size) {
+			nvme_mdev_mmio_db_invalid(vctrl, q->qid, q->size,
+						  new_head);
+			return;
+		}
+
 		while (q->head != new_head) {
 			nvme_mdev_vcq_advance_head(q);
-			WARN_ON_ONCE(q->pending == 0);
 			if (q->pending > 0)
 				q->pending--;
 		}
