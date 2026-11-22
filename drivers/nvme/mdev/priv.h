@@ -16,6 +16,7 @@
 #include <linux/pci.h>
 #include <linux/blkdev.h>
 #include <linux/bio.h>
+#include <linux/blk-mq-dma.h>
 #include <linux/eventfd.h>
 #include <linux/workqueue.h>
 #include <linux/dmapool.h>
@@ -129,6 +130,16 @@ struct nvme_mdev_vns {
 
 	/* Optimal IO boundary*/
 	u16 noiob;
+
+	/*
+	 * DMA pre-mapping of the guest's pinned pages for the host device
+	 * (NULL if it doesn't support it): its bios aren't mapped and
+	 * unmapped one by one.  premap_off: adding pages failed, it's not
+	 * used any more (and goes away when it safely can).  I/O thread or
+	 * lock with the thread paused.
+	 */
+	struct blk_dma_premap *premap;
+	bool premap_off;
 };
 
 /*
@@ -616,6 +627,12 @@ int nvme_mdev_vns_destroy(struct nvme_mdev_vctrl *vctrl,
 			  u32 user_nsid);
 void nvme_mdev_vns_destroy_all(struct nvme_mdev_vctrl *vctrl);
 
+void nvme_mdev_vctrl_premap_add(struct nvme_mdev_vctrl *vctrl,
+				struct page **pages, unsigned int nr);
+void nvme_mdev_vctrl_premap_remove(struct nvme_mdev_vctrl *vctrl,
+				   struct page **pages, unsigned int nr);
+int nvme_mdev_viommu_premap_all(struct nvme_mdev_viommu *viommu,
+				struct blk_dma_premap *pm);
 struct nvme_mdev_vns *nvme_mdev_vns_from_vnsid(struct nvme_mdev_vctrl *vctrl,
 					       u32 user_ns_id);
 

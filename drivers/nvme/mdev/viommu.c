@@ -68,6 +68,15 @@ static void nvme_mdev_chunk_free(struct nvme_mdev_viommu *viommu,
 {
 	unsigned int i;
 
+	/* out of the DMA pre-mappings first */
+	if (chunk->whole)
+		nvme_mdev_vctrl_premap_remove(viommu->vctrl, chunk->pages,
+					      NVME_MDEV_CHUNK_PAGES);
+	else
+		for_each_set_bit(i, chunk->pinned, NVME_MDEV_CHUNK_PAGES)
+			nvme_mdev_vctrl_premap_remove(viommu->vctrl,
+						      &chunk->pages[i], 1);
+
 	if (chunk->whole)
 		vfio_unpin_pages(viommu->vdev, chunk->iova,
 				 NVME_MDEV_CHUNK_PAGES);
@@ -93,6 +102,8 @@ static void nvme_mdev_chunk_pin_whole(struct nvme_mdev_viommu *viommu,
 		return;
 	}
 	chunk->whole = true;
+	nvme_mdev_vctrl_premap_add(viommu->vctrl, chunk->pages,
+				   NVME_MDEV_CHUNK_PAGES);
 	/* publish the pages before the bits, see nvme_mdev_viommu_translate */
 	smp_wmb();
 	bitmap_fill(chunk->pinned, NVME_MDEV_CHUNK_PAGES);
@@ -164,10 +175,40 @@ static int nvme_mdev_viommu_pin(struct nvme_mdev_viommu *viommu,
 		     &iova, ret);
 		return ret < 0 ? ret : -EFAULT;
 	}
+	nvme_mdev_vctrl_premap_add(viommu->vctrl, &chunk->pages[i], 1);
 
 	/* the page (and ro bit) before the bit, see ..._viommu_translate() */
 	smp_wmb();
 	set_bit(i, chunk->pinned);
+	return 0;
+}
+
+/*
+ * A new DMA pre-mapping: all the pages pinned so far go in (I/O thread
+ * paused, lock held)
+ */
+int nvme_mdev_viommu_premap_all(struct nvme_mdev_viommu *viommu,
+				struct blk_dma_premap *pm)
+{
+	struct nvme_mdev_chunk *chunk;
+	unsigned long idx;
+	unsigned int i;
+	int ret;
+
+	xa_for_each(&viommu->chunks, idx, chunk) {
+		if (chunk->whole) {
+			ret = blk_dma_premap_add(pm, chunk->pages,
+						 NVME_MDEV_CHUNK_PAGES);
+			if (ret)
+				return ret;
+			continue;
+		}
+		for_each_set_bit(i, chunk->pinned, NVME_MDEV_CHUNK_PAGES) {
+			ret = blk_dma_premap_add(pm, &chunk->pages[i], 1);
+			if (ret)
+				return ret;
+		}
+	}
 	return 0;
 }
 

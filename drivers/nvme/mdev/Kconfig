@@ -4,6 +4,7 @@ config NVME_MDEV_VFIO
 	depends on BLOCK && VFIO && 64BIT
 	select VFIO_MDEV
 	select VHOST_TASK
+	select BLK_DMA_PREMAP
 	help
 	  Exposes host block devices (e.g. NVMe namespaces or partitions of
 	  them) to a guest as the namespaces of a virtual NVMe PCIe

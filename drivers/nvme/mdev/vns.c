@@ -130,6 +130,82 @@ static const struct blk_holder_ops nvme_mdev_vns_holder_ops = {
 	.mark_dead = nvme_mdev_vns_mark_dead,
 };
 
+/*
+ * Guest pages were pinned: into the DMA pre-mappings of the namespaces.
+ * (I/O thread, or lock held with it paused.)
+ */
+void nvme_mdev_vctrl_premap_add(struct nvme_mdev_vctrl *vctrl,
+				struct page **pages, unsigned int nr)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < MAX_VIRTUAL_NAMESPACES; i++) {
+		struct nvme_mdev_vns *vns = vctrl->namespaces[i];
+
+		if (!vns || !vns->premap || vns->premap_off)
+			continue;
+		ret = blk_dma_premap_add(vns->premap, pages, nr);
+		if (ret) {
+			/* (it goes away once nothing in flight uses it) */
+			_INFO(vctrl, "namespace %u: DMA pre-mapping off (%d)\n",
+			      vns->nsid, ret);
+			vns->premap_off = true;
+		}
+	}
+}
+
+/*
+ * Guest pages are about to be unpinned: out of the DMA pre-mappings.
+ * (Lock held, I/O thread paused: nothing in flight.)
+ */
+void nvme_mdev_vctrl_premap_remove(struct nvme_mdev_vctrl *vctrl,
+				   struct page **pages, unsigned int nr)
+{
+	unsigned int i;
+
+	for (i = 0; i < MAX_VIRTUAL_NAMESPACES; i++) {
+		struct nvme_mdev_vns *vns = vctrl->namespaces[i];
+
+		if (!vns || !vns->premap)
+			continue;
+		if (vns->premap_off) {
+			blk_dma_premap_free(vns->premap);
+			vns->premap = NULL;
+			continue;
+		}
+		blk_dma_premap_remove(vns->premap, pages, nr);
+	}
+}
+
+/*
+ * Set up the DMA pre-mapping of a new namespace, with the pages pinned so
+ * far (lock held, I/O thread paused)
+ */
+static void nvme_mdev_vns_premap(struct nvme_mdev_vctrl *vctrl,
+				 struct nvme_mdev_vns *vns)
+{
+	struct blk_dma_premap *pm;
+	int ret;
+
+	pm = blk_dma_premap_alloc(vns->host_part);
+	if (IS_ERR(pm)) {
+		_INFO(vctrl, "namespace %u: no DMA pre-mapping for %pg (%ld)\n",
+		      vns->nsid, vns->host_part, PTR_ERR(pm));
+		return;
+	}
+	ret = nvme_mdev_viommu_premap_all(&vctrl->viommu, pm);
+	if (ret) {
+		_INFO(vctrl, "namespace %u: DMA pre-mapping failed (%d)\n",
+		      vns->nsid, ret);
+		blk_dma_premap_free(pm);
+		return;
+	}
+	vns->premap = pm;
+	_INFO(vctrl, "namespace %u: DMA pre-mapping for %pg\n", vns->nsid,
+	      vns->host_part);
+}
+
 /* Open a host block device (e.g. /dev/nvme0n1p5) as a new namespace */
 int nvme_mdev_vns_open(struct nvme_mdev_vctrl *vctrl, const char *path)
 {
@@ -191,6 +267,7 @@ int nvme_mdev_vns_open(struct nvme_mdev_vctrl *vctrl, const char *path)
 
 	vctrl->namespaces[user_nsid - 1] = vns;
 	vns->nsid = user_nsid;
+	nvme_mdev_vns_premap(vctrl, vns);
 
 	/* Announce the new namespace to the user */
 	nvme_mdev_vns_send_event(vctrl, user_nsid);
@@ -221,6 +298,7 @@ static int __nvme_mdev_vns_destroy(struct nvme_mdev_vctrl *vctrl, u32 user_nsid)
 	nvme_mdev_io_pause(vctrl);
 
 	vctrl->namespaces[user_nsid - 1] = NULL;
+	blk_dma_premap_free(vns->premap);
 	bdev_fput(vns->bdev_file);
 	kfree(vns);
 	nvme_mdev_io_resume(vctrl);

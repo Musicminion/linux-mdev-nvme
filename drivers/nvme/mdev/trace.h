@@ -58,6 +58,24 @@ TRACE_EVENT(nvme_mdev_io_complete,
 		  __entry->sqid, __entry->cid, __entry->status)
 );
 
+/* A guest read or write went to the host with DMA pre-mapped pages */
+TRACE_EVENT(nvme_mdev_io_premapped,
+	TP_PROTO(struct nvme_mdev_vctrl *vctrl, u32 nsid, u32 bytes),
+	TP_ARGS(vctrl, nsid, bytes),
+	TP_STRUCT__entry(
+		__string(dev, dev_name(mdev_dev(vctrl->mdev)))
+		__field(u32, nsid)
+		__field(u32, bytes)
+	),
+	TP_fast_assign(
+		__assign_str(dev);
+		__entry->nsid = nsid;
+		__entry->bytes = bytes;
+	),
+	TP_printk("%s nsid=%u bytes=%u", __get_str(dev), __entry->nsid,
+		  __entry->bytes)
+);
+
 TRACE_EVENT(nvme_mdev_irq,
 	TP_PROTO(struct nvme_mdev_vctrl *vctrl, unsigned int vector),
 	TP_ARGS(vctrl, vector),

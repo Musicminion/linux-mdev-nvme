@@ -16,6 +16,7 @@
 #include <linux/module.h>
 #include <linux/log2.h>
 #include "priv.h"
+#include "trace.h"
 
 /* ------------------------------------------------------------------ */
 /* the parent device and the instance type */
@@ -296,6 +297,7 @@ int nvme_mdev_hctrl_hq_submit(struct nvme_mdev_hctrl *hctrl,
 	struct request_queue *q;
 	bool polled_q = false;
 	struct mbio *mbio;
+	bool premap = false;
 	u8 opcode = cmd->common.opcode;
 	blk_opf_t opf;
 	int retval;
@@ -339,6 +341,8 @@ int nvme_mdev_hctrl_hq_submit(struct nvme_mdev_hctrl *hctrl,
 		if (WARN_ON(datait->count > BIO_MAX_VECS))
 			return -EINVAL;
 
+		/* the guest's pages DMA pre-mapped for the host device? */
+		premap = vns->premap && !vns->premap_off;
 		bio = bio_alloc_bioset(vns->host_part, datait->count, opf,
 				       GFP_KERNEL, &hwq->bioset);
 		if (WARN_ON(!bio))
@@ -358,7 +362,11 @@ int nvme_mdev_hctrl_hq_submit(struct nvme_mdev_hctrl *hctrl,
 			if (WARN_ON(datalength == 0))
 				break;
 
-			if (bio_add_page(bio, page, chunk, offset) != chunk) {
+			/* pre-mapped: one bio_vec per page, see bio_set_premap() */
+			if (premap) {
+				__bio_add_page(bio, page, chunk, offset);
+			} else if (bio_add_page(bio, page, chunk, offset) !=
+				   chunk) {
 				WARN_ON(1);
 				retval = -ENOMEM;
 				goto error;
@@ -370,6 +378,11 @@ int nvme_mdev_hctrl_hq_submit(struct nvme_mdev_hctrl *hctrl,
 				goto error;
 			datalength -= chunk;
 		}
+		/* (a pin during the translation may have failed to add) */
+		if (premap && !vns->premap_off &&
+		    bio_set_premap(bio, vns->premap))
+			trace_nvme_mdev_io_premapped(vns->vctrl, vns->nsid,
+						     bio->bi_iter.bi_size);
 
 	/* flush request */
 	} else if (opcode == nvme_cmd_flush) {
