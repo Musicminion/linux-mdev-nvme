@@ -18,6 +18,10 @@
  * whole chunk is mapped, otherwise page by page.  Every unpin uses exactly
  * the range of the matching pin, as required by iommufd.
  *
+ * With an IOMMU in the guest, its mappings can be read-only (what it maps
+ * DMA_TO_DEVICE): those pages are pinned for reading only, and the device
+ * may only read them, like a real one behind that IOMMU.
+ *
  * (The 2019 version instead pinned all of guest memory up front from a
  * VFIO "map" notifier that never went upstream.)
  */
@@ -36,6 +40,7 @@ struct nvme_mdev_chunk {
 	dma_addr_t iova;		/* first guest address of the chunk */
 	bool whole;			/* pinned with one vfio_pin_pages() */
 	DECLARE_BITMAP(pinned, NVME_MDEV_CHUNK_PAGES);
+	DECLARE_BITMAP(ro, NVME_MDEV_CHUNK_PAGES);	/* read-only pins */
 	struct page *pages[NVME_MDEV_CHUNK_PAGES];
 };
 
@@ -147,13 +152,20 @@ static int nvme_mdev_viommu_pin(struct nvme_mdev_viommu *viommu,
 
 	ret = vfio_pin_pages(viommu->vdev, chunk_page_iova(chunk, i), 1,
 			     CHUNK_PROT, &chunk->pages[i]);
+	if (ret == -EPERM) {
+		/* mapped read-only: the device may only read the page */
+		ret = vfio_pin_pages(viommu->vdev, chunk_page_iova(chunk, i),
+				     1, IOMMU_READ, &chunk->pages[i]);
+		if (ret == 1)
+			set_bit(i, chunk->ro);
+	}
 	if (ret != 1) {
 		_DBG(viommu->vctrl, "vIOMMU: pin of IOVA %pad failed (%d)\n",
 		     &iova, ret);
 		return ret < 0 ? ret : -EFAULT;
 	}
 
-	/* the page before the bit, see nvme_mdev_viommu_translate() */
+	/* the page (and ro bit) before the bit, see ..._viommu_translate() */
 	smp_wmb();
 	set_bit(i, chunk->pinned);
 	return 0;
@@ -227,9 +239,12 @@ void nvme_mdev_viommu_unblock_range(struct nvme_mdev_viommu *viommu)
 	spin_unlock(&viommu->unmap_lock);
 }
 
-/* Translate an IOVA to a physical address and read device bus address */
+/*
+ * Translate an IOVA to a physical address and read device bus address;
+ * @write: the device will write the page
+ */
 int nvme_mdev_viommu_translate(struct nvme_mdev_viommu *viommu,
-			       dma_addr_t iova,
+			       dma_addr_t iova, bool write,
 			       dma_addr_t *physical,
 			       dma_addr_t *host_iova)
 {
@@ -250,14 +265,19 @@ int nvme_mdev_viommu_translate(struct nvme_mdev_viommu *viommu,
 	/* pairs with the smp_wmb() before setting the pinned bit */
 	smp_rmb();
 
+	/* the guest's IOMMU doesn't let the device write there */
+	if (write && test_bit(i, chunk->ro))
+		return -EACCES;
+
 	*physical = page_to_phys(chunk->pages[i]);
 	*host_iova = 0;		/* unused: the block layer maps the pages */
 	return 0;
 }
 
-/* map an IOVA to kernel address space  */
+/* map an IOVA to kernel address space (@write: the device writes there) */
 int nvme_mdev_viommu_create_kmap(struct nvme_mdev_viommu *viommu,
-				 dma_addr_t iova, struct page_map *page)
+				 dma_addr_t iova, bool write,
+				 struct page_map *page)
 {
 	dma_addr_t host_iova;
 	phys_addr_t physical;
@@ -265,8 +285,10 @@ int nvme_mdev_viommu_create_kmap(struct nvme_mdev_viommu *viommu,
 	int ret;
 
 	page->iova = iova;
+	page->write = write;
 
-	ret = nvme_mdev_viommu_translate(viommu, iova, &physical, &host_iova);
+	ret = nvme_mdev_viommu_translate(viommu, iova, write, &physical,
+					 &host_iova);
 	if (ret)
 		return ret;
 
@@ -288,7 +310,7 @@ void nvme_mdev_viommu_update_kmap(struct nvme_mdev_viommu *viommu,
 	struct page *new_page;
 	int ret;
 
-	ret = nvme_mdev_viommu_translate(viommu, page->iova,
+	ret = nvme_mdev_viommu_translate(viommu, page->iova, page->write,
 					 &physical, &host_iova);
 	if (ret) {
 		nvme_mdev_viommu_free_kmap(viommu, page);

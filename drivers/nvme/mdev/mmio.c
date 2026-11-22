@@ -523,13 +523,14 @@ int nvme_mdev_mmio_enable_dbs_shadow(struct nvme_mdev_vctrl *vctrl,
 
 	nvme_mdev_assert_io_not_running(vctrl);
 
-	ret = nvme_mdev_viommu_create_kmap(&vctrl->viommu,
-					   sdb_iova, &vctrl->mmio.sdb_map);
+	/* (we write both: doorbell values, event indexes) */
+	ret = nvme_mdev_viommu_create_kmap(&vctrl->viommu, sdb_iova, true,
+					   &vctrl->mmio.sdb_map);
 	if (ret)
 		return ret;
 
-	ret = nvme_mdev_viommu_create_kmap(&vctrl->viommu,
-					   eidx_iova, &vctrl->mmio.seidx_map);
+	ret = nvme_mdev_viommu_create_kmap(&vctrl->viommu, eidx_iova, true,
+					   &vctrl->mmio.seidx_map);
 	if (ret) {
 		nvme_mdev_viommu_free_kmap(&vctrl->viommu,
 					   &vctrl->mmio.sdb_map);

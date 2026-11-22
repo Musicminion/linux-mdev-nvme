@@ -295,7 +295,7 @@ static int nvme_mdev_adm_handle_id(struct adm_ctx *ctx)
 
 	int ret = nvme_mdev_udata_iter_set_dptr(&ctx->udatait,
 						&ctx->in->common.dptr,
-						NVME_IDENTIFY_DATA_SIZE);
+						NVME_IDENTIFY_DATA_SIZE, true);
 
 	u32 nsid = le32_to_cpu(in->nsid);
 
@@ -418,7 +418,7 @@ static int nvme_mdev_adm_handle_get_log_page(struct adm_ctx *ctx)
 
 	/* map data pointer */
 	ret = nvme_mdev_udata_iter_set_dptr(&ctx->udatait,
-					    &in->dptr, ctx->datalen);
+					    &in->dptr, ctx->datalen, true);
 	if (ret)
 		return nvme_mdev_translate_error(ret);
 
