@@ -278,6 +278,8 @@ struct nvme_mdev_vctrl {
 	struct llist_head io_done;
 	struct work_struct adm_done_work;
 	atomic_t io_inflight;		/* I/O commands not completed yet */
+	/* those, oldest first (the I/O thread's, or with it paused) */
+	struct list_head io_list;
 
 	/*
 	 * The I/O thread: a vhost_task, i.e. a thread of the process that
@@ -337,6 +339,7 @@ struct nvme_mdev_iod {
 	struct nvme_completion cqe;
 	struct nvme_mdev_vctrl *vctrl;
 	struct llist_node done;
+	struct list_head link;		/* I/O: in vctrl->io_list */
 	u16 sqid;
 
 	/* the command's data: the guest's pages, no bounce buffer */
@@ -409,6 +412,7 @@ void nvme_mdev_nvmet_delete_sq(struct nvme_mdev_vctrl *vctrl, u16 sqid);
 void nvme_mdev_adm_process_sq(struct nvme_mdev_vctrl *vctrl);
 bool nvme_mdev_nvmet_submit_io(struct nvme_mdev_vctrl *vctrl, u16 sqid);
 unsigned int nvme_mdev_nvmet_reap_io(struct nvme_mdev_vctrl *vctrl);
+void nvme_mdev_nvmet_poll_io(struct nvme_mdev_vctrl *vctrl);
 
 /* instance.c */
 extern struct mdev_driver nvme_mdev_driver;

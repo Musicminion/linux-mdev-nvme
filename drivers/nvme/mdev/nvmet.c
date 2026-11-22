@@ -221,6 +221,7 @@ bool nvme_mdev_nvmet_submit_io(struct nvme_mdev_vctrl *vctrl, u16 sqid)
 	}
 
 	atomic_inc(&vctrl->io_inflight);
+	list_add_tail(&iod->link, &vctrl->io_list);
 	trace_nvme_mdev_io_submit(vctrl, sqid, &iod->cmd);
 	nvme_mdev_iod_start(iod);
 	return true;
@@ -253,11 +254,35 @@ unsigned int nvme_mdev_nvmet_reap_io(struct nvme_mdev_vctrl *vctrl)
 		if (test_bit(iod->sqid, vctrl->vsq_en))
 			nvme_mdev_vsq_cmd_done_io(vctrl, iod->sqid, cid, status,
 						  iod->cqe.result.u64);
+		list_del(&iod->link);
 		nvme_mdev_iod_free(iod);
 		atomic_dec(&vctrl->io_inflight);
 		n++;
 	}
 	return n;
+}
+
+/*
+ * I/O thread: poll for the completion of the I/O commands in flight that
+ * nvmet submitted as polled bios (NVMF_POLLED_IO), which completes them
+ * (->queue_response).  One poll reaps everything done on the host queue it
+ * looks at; our bios go to the poll queue of the CPU we run on, so the
+ * newest command covers almost all of them, the oldest the ones submitted
+ * before the thread moved to another CPU.
+ */
+void nvme_mdev_nvmet_poll_io(struct nvme_mdev_vctrl *vctrl)
+{
+	struct nvme_mdev_iod *first, *last;
+
+	if (list_empty(&vctrl->io_list))
+		return;
+
+	last = list_last_entry(&vctrl->io_list, struct nvme_mdev_iod, link);
+	nvmet_req_poll(&last->req, BLK_POLL_ONESHOT);
+
+	first = list_first_entry(&vctrl->io_list, struct nvme_mdev_iod, link);
+	if (first != last)
+		nvmet_req_poll(&first->req, BLK_POLL_ONESHOT);
 }
 
 /* ------------------------------------------------------------------ */
@@ -549,6 +574,8 @@ static void nvme_mdev_nvmet_delete_work(struct work_struct *work)
 static const struct nvmet_fabrics_ops nvme_mdev_nvmet_ops = {
 	.owner		= THIS_MODULE,
 	.type		= NVMF_TRTYPE_PCI,
+	/* the I/O thread polls (nvme_mdev_nvmet_poll_io()) */
+	.flags		= NVMF_POLLED_IO,
 	.add_port	= nvme_mdev_nvmet_op_add_port,
 	.remove_port	= nvme_mdev_nvmet_op_remove_port,
 	.queue_response	= nvme_mdev_nvmet_queue_response,
@@ -685,6 +712,7 @@ void nvme_mdev_nvmet_vctrl_init(struct nvme_mdev_vctrl *vctrl)
 	init_llist_head(&vctrl->adm_done);
 	init_llist_head(&vctrl->io_done);
 	atomic_set(&vctrl->io_inflight, 0);
+	INIT_LIST_HEAD(&vctrl->io_list);
 	INIT_WORK(&vctrl->adm_done_work, nvme_mdev_nvmet_adm_done_work);
 	INIT_WORK(&vctrl->nvmet_delete_work, nvme_mdev_nvmet_delete_work);
 	/* the instance's UUID, as the mdev core shows it */

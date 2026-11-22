@@ -94,6 +94,7 @@ static void nvme_mdev_io_polling_loop(struct io_ctx *ctx)
 		blk_finish_plug(&plug);
 
 		/* the commands nvmet completed */
+		nvme_mdev_nvmet_poll_io(vctrl);
 		if (nvme_mdev_nvmet_reap_io(vctrl))
 			ctx->last_io_t = vctrl->now;
 
@@ -118,6 +119,7 @@ static void nvme_mdev_io_polling_loop(struct io_ctx *ctx)
 	wait_start = ktime_get();
 	while (atomic_read(&vctrl->io_inflight)) {
 		vctrl->now = ktime_get();
+		nvme_mdev_nvmet_poll_io(vctrl);
 		if (!nvme_mdev_nvmet_reap_io(vctrl)) {
 			if (timeout(wait_start, vctrl->now,
 				    NVME_MDEV_IO_TIMEOUT_MS)) {
