@@ -101,6 +101,26 @@ TRACE_EVENT(nvme_mdev_doorbell,
 		  __entry->sq ? "sq" : "cq", __entry->qid, __entry->value)
 );
 
+/* A step of the VFIO migration state machine (enum vfio_device_mig_state) */
+TRACE_EVENT(nvme_mdev_mig_state,
+	TP_PROTO(struct nvme_mdev_vctrl *vctrl, int from, int to, int ret),
+	TP_ARGS(vctrl, from, to, ret),
+	TP_STRUCT__entry(
+		__string(dev, dev_name(mdev_dev(vctrl->mdev)))
+		__field(int, from)
+		__field(int, to)
+		__field(int, ret)
+	),
+	TP_fast_assign(
+		__assign_str(dev);
+		__entry->from = from;
+		__entry->to = to;
+		__entry->ret = ret;
+	),
+	TP_printk("%s %d -> %d: %d", __get_str(dev), __entry->from,
+		  __entry->to, __entry->ret)
+);
+
 #endif /* _TRACE_NVME_MDEV_H */
 
 #undef TRACE_INCLUDE_PATH

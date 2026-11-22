@@ -227,6 +227,8 @@ void nvme_mdev_vctrl_release(struct nvme_mdev_vctrl *vctrl)
 	 */
 	nvme_mdev_viommu_reset(&vctrl->viommu);
 	vctrl->inuse = false;
+	/* (closed while stopped for migration) */
+	vctrl->mig_stopped = false;
 	mutex_unlock(&vctrl->lock);
 
 	_INFO(vctrl, "device is released\n");

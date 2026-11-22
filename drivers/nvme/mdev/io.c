@@ -232,7 +232,8 @@ void nvme_mdev_io_resume(struct nvme_mdev_vctrl *vctrl)
 	lockdep_assert_held(&vctrl->lock);
 
 	if (!vctrl->iothread || nvme_mdev_io_is_self(vctrl) ||
-	    vctrl->vctrl_paused || READ_ONCE(vctrl->io_dead))
+	    vctrl->vctrl_paused || vctrl->mig_stopped ||
+	    READ_ONCE(vctrl->io_dead))
 		return;
 
 	if (vctrl->iothread_parked) {

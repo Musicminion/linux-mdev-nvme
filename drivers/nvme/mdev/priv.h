@@ -85,6 +85,9 @@ struct nvme_vcq {
 	/* number of items pending*/
 	u16 pending;
 
+	/* not contiguous: the IOVA of each page (dirty tracking) */
+	dma_addr_t *page_iovas;
+
 	/* IRQ settings */
 	int irq /* -1 if disabled*/;
 
@@ -220,6 +223,8 @@ struct nvme_mdev_io_region {
 
 struct io_ctx;
 struct vhost_task;
+struct nvme_mdev_mig_file;
+struct nvme_mdev_dirty_log;
 
 /*Virtual NVME controller state */
 struct nvme_mdev_vctrl {
@@ -277,6 +282,8 @@ struct nvme_mdev_vctrl {
 	struct llist_head adm_done;
 	struct llist_head io_done;
 	struct work_struct adm_done_work;
+	/* admin commands nvmet has, or whose completion isn't posted yet */
+	struct list_head adm_list;	/* under lock */
 	atomic_t io_inflight;		/* I/O commands not completed yet */
 	/* those, oldest first (the I/O thread's, or with it paused) */
 	struct list_head io_list;
@@ -303,6 +310,20 @@ struct nvme_mdev_vctrl {
 	unsigned int poll_timeout_ms;	/* 0: never stop polling */
 
 	bool vctrl_paused; /* true when the host device paused our IO */
+
+	/*
+	 * Live migration (migration.c): the VFIO migration state, and
+	 * whether the controller is stopped (STOP and after; under lock):
+	 * no commands are fetched, no completions or interrupts posted.
+	 */
+	struct mutex mig_lock;
+	enum vfio_device_mig_state mig_state;
+	bool mig_stopped;
+	struct nvme_mdev_mig_file *saving_migf;
+	struct nvme_mdev_mig_file *resuming_migf;
+	/* DMA logging: what we wrote into guest memory */
+	struct mutex dirty_lock;
+	struct nvme_mdev_dirty_log __rcu *dirty_log;
 
 };
 
@@ -332,6 +353,18 @@ struct nvme_mdev_hctrl {
 	struct mdev_type *type_ptr;
 };
 
+/* guest memory a command's data is in, recorded while dirty logging */
+struct nvme_mdev_iova_range {
+	u64 iova;
+	u64 len;
+};
+
+struct nvme_mdev_iova_ranges {
+	unsigned int nr;
+	unsigned int max;
+	struct nvme_mdev_iova_range r[] __counted_by(max);
+};
+
 /* A command, from the guest's queue to nvmet and back */
 struct nvme_mdev_iod {
 	struct nvmet_req req;
@@ -339,8 +372,11 @@ struct nvme_mdev_iod {
 	struct nvme_completion cqe;
 	struct nvme_mdev_vctrl *vctrl;
 	struct llist_node done;
-	struct list_head link;		/* I/O: in vctrl->io_list */
+	/* in vctrl->io_list (I/O) or vctrl->adm_list (admin) */
+	struct list_head link;
+	bool completed;			/* nvmet completed it */
 	u16 sqid;
+	struct nvme_mdev_iova_ranges *dirty;
 
 	/* the command's data: the guest's pages, no bounce buffer */
 	struct sg_table sgt;
@@ -411,8 +447,30 @@ void nvme_mdev_nvmet_delete_cq(struct nvme_mdev_vctrl *vctrl, u16 cqid);
 void nvme_mdev_nvmet_delete_sq(struct nvme_mdev_vctrl *vctrl, u16 sqid);
 void nvme_mdev_adm_process_sq(struct nvme_mdev_vctrl *vctrl);
 bool nvme_mdev_nvmet_submit_io(struct nvme_mdev_vctrl *vctrl, u16 sqid);
+void nvme_mdev_nvmet_reap_adm(struct nvme_mdev_vctrl *vctrl);
+int nvme_mdev_nvmet_resubmit_adm(struct nvme_mdev_vctrl *vctrl,
+				 const struct nvme_command *cmd);
+int nvme_mdev_nvmet_hold_adm_cqe(struct nvme_mdev_vctrl *vctrl, u8 opcode,
+				 u16 cid, u16 status, __le64 result);
 unsigned int nvme_mdev_nvmet_reap_io(struct nvme_mdev_vctrl *vctrl);
 void nvme_mdev_nvmet_poll_io(struct nvme_mdev_vctrl *vctrl);
+
+/* migration.c */
+void nvme_mdev_mig_init(struct nvme_mdev_vctrl *vctrl);
+void nvme_mdev_mig_close(struct nvme_mdev_vctrl *vctrl);
+void nvme_mdev_mig_reset(struct nvme_mdev_vctrl *vctrl);
+void nvme_mdev_mig_cleanup(struct nvme_mdev_vctrl *vctrl);
+bool nvme_mdev_dirty_logging(struct nvme_mdev_vctrl *vctrl);
+void nvme_mdev_dirty_mark_vcq(struct nvme_mdev_vctrl *vctrl,
+			      struct nvme_vcq *q);
+void nvme_mdev_dirty_mark_shadow_dbs(struct nvme_mdev_vctrl *vctrl);
+void nvme_mdev_dirty_mark(struct nvme_mdev_vctrl *vctrl, u64 iova, u64 len);
+void nvme_mdev_dirty_mark_cmd(struct nvme_mdev_vctrl *vctrl,
+			      const struct nvme_command *cmd,
+			      const struct nvme_mdev_iova_ranges *ranges);
+struct nvme_mdev_iova_ranges *nvme_mdev_iova_ranges_alloc(unsigned int max);
+void nvme_mdev_iova_ranges_add(struct nvme_mdev_iova_ranges *ranges,
+			       u64 iova, u64 len);
 
 /* instance.c */
 extern struct mdev_driver nvme_mdev_driver;
@@ -436,7 +494,8 @@ void nvme_mdev_mmio_free(struct nvme_mdev_vctrl *vctrl);
 
 int nvme_mdev_mmio_enable_dbs(struct nvme_mdev_vctrl *vctrl);
 int nvme_mdev_mmio_enable_dbs_shadow(struct nvme_mdev_vctrl *vctrl,
-				     dma_addr_t sdb_iova, dma_addr_t eidx_iova);
+				     dma_addr_t sdb_iova, dma_addr_t eidx_iova,
+				     bool sync);
 
 void nvme_mdev_mmio_viommu_update(struct nvme_mdev_vctrl *vctrl);
 void nvme_mdev_mmio_disable_dbs(struct nvme_mdev_vctrl *vctrl);
@@ -525,12 +584,14 @@ int nvme_mdev_udata_iter_set_dptr(struct nvme_ext_data_iter *it,
 
 void *nvme_mdev_udata_queue_vmap(struct nvme_mdev_viommu *viommu,
 				 dma_addr_t iova,
-				 unsigned int size, bool cont);
+				 unsigned int size, bool cont,
+				 dma_addr_t *page_iovas);
 
 u16 nvme_mdev_udata_map_sg(struct nvme_mdev_viommu *viommu,
 			   const struct nvme_command *cmd, u32 len,
 			   struct sg_table *sgt, struct scatterlist *inline_sg,
-			   unsigned int inline_nents);
+			   unsigned int inline_nents,
+			   struct nvme_mdev_iova_ranges **ranges);
 void nvme_mdev_udata_unmap_sg(struct sg_table *sgt,
 			      struct scatterlist *inline_sg);
 /* viommu.c */

@@ -4,6 +4,7 @@ config NVME_MDEV_VFIO
 	depends on NVME_TARGET && VFIO && 64BIT
 	select VFIO_MDEV
 	select VHOST_TASK
+	select IOMMUFD_DRIVER
 	help
 	  A virtual NVMe PCIe controller for guests, as a VFIO mediated
 	  device, whose commands are executed by the NVMe target (nvmet):

@@ -59,6 +59,7 @@ static struct nvme_mdev_iod *nvme_mdev_iod_alloc(struct nvme_mdev_vctrl *vctrl,
 static void nvme_mdev_iod_free(struct nvme_mdev_iod *iod)
 {
 	nvme_mdev_udata_unmap_sg(&iod->sgt, iod->inline_sg);
+	kfree(iod->dirty);
 	kmem_cache_free(nvme_mdev_iod_cache, iod);
 }
 
@@ -68,6 +69,8 @@ static void nvme_mdev_nvmet_queue_response(struct nvmet_req *req)
 	struct nvme_mdev_iod *iod = container_of(req, struct nvme_mdev_iod, req);
 	struct nvme_mdev_vctrl *vctrl = iod->vctrl;
 
+	/* release: the result is in, for nvme_mdev_mig_save() */
+	smp_store_release(&iod->completed, true);
 	if (iod->sqid) {
 		/* the I/O thread polls while it has commands in flight */
 		llist_add(&iod->done, &vctrl->io_done);
@@ -112,7 +115,9 @@ static void nvme_mdev_iod_start(struct nvme_mdev_iod *iod)
 							&iod->cmd, len,
 							&iod->sgt,
 							iod->inline_sg,
-							ARRAY_SIZE(iod->inline_sg));
+							ARRAY_SIZE(iod->inline_sg),
+							nvme_mdev_dirty_logging(vctrl) ?
+							&iod->dirty : NULL);
 		if (status) {
 			nvmet_req_uninit(req);
 			nvme_mdev_iod_fail(iod, status);
@@ -132,7 +137,7 @@ static inline u16 nvme_mdev_iod_status(struct nvme_mdev_iod *iod)
 }
 
 /* Write the completion entries of the finished admin commands */
-static void nvme_mdev_nvmet_reap_adm(struct nvme_mdev_vctrl *vctrl)
+void nvme_mdev_nvmet_reap_adm(struct nvme_mdev_vctrl *vctrl)
 {
 	struct nvme_mdev_iod *iod, *tmp;
 	struct llist_node *list;
@@ -149,9 +154,12 @@ static void nvme_mdev_nvmet_reap_adm(struct nvme_mdev_vctrl *vctrl)
 			     cid, iod->cmd.common.opcode, status);
 
 		/* (not if the queue went away meanwhile) */
-		if (test_bit(0, vctrl->vsq_en))
+		if (test_bit(0, vctrl->vsq_en)) {
+			nvme_mdev_dirty_mark_cmd(vctrl, &iod->cmd, iod->dirty);
 			nvme_mdev_vsq_cmd_done_adm(vctrl, iod->cqe.result.u64,
 						   cid, status);
+		}
+		list_del(&iod->link);
 		nvme_mdev_iod_free(iod);
 	}
 }
@@ -162,7 +170,9 @@ static void nvme_mdev_nvmet_adm_done_work(struct work_struct *work)
 		container_of(work, struct nvme_mdev_vctrl, adm_done_work);
 
 	mutex_lock(&vctrl->lock);
-	nvme_mdev_nvmet_reap_adm(vctrl);
+	/* stopped for migration: posted when it runs again, or saved */
+	if (!vctrl->mig_stopped)
+		nvme_mdev_nvmet_reap_adm(vctrl);
 	mutex_unlock(&vctrl->lock);
 }
 
@@ -192,11 +202,60 @@ void nvme_mdev_adm_process_sq(struct nvme_mdev_vctrl *vctrl)
 		}
 
 		_DBG(vctrl, "ADMINQ: opcode 0x%x\n", iod->cmd.common.opcode);
+		list_add_tail(&iod->link, &vctrl->adm_list);
 		nvme_mdev_iod_start(iod);
 		nvme_mdev_nvmet_reap_adm(vctrl);
 	}
 
 	nvme_mdev_io_resume(vctrl);
+}
+
+/*
+ * Migration, on the destination: give nvmet an admin command again that
+ * the source's nvmet had in flight (an Asynchronous Event Request).
+ */
+int nvme_mdev_nvmet_resubmit_adm(struct nvme_mdev_vctrl *vctrl,
+				 const struct nvme_command *cmd)
+{
+	struct nvme_mdev_iod *iod;
+
+	lockdep_assert_held(&vctrl->lock);
+
+	if (!vctrl->tctrl)
+		return -ENODEV;
+	iod = nvme_mdev_iod_alloc(vctrl, 0);
+	if (!iod)
+		return -ENOMEM;
+	iod->cmd = *cmd;
+	list_add_tail(&iod->link, &vctrl->adm_list);
+	nvme_mdev_iod_start(iod);
+	return 0;
+}
+
+/*
+ * Migration, on the destination: an admin command the source's nvmet
+ * completed while stopped; its completion entry is written when we run.
+ */
+int nvme_mdev_nvmet_hold_adm_cqe(struct nvme_mdev_vctrl *vctrl, u8 opcode,
+				 u16 cid, u16 status, __le64 result)
+{
+	struct nvme_mdev_iod *iod;
+
+	lockdep_assert_held(&vctrl->lock);
+
+	if (!vctrl->tctrl)
+		return -ENODEV;
+	iod = nvme_mdev_iod_alloc(vctrl, 0);
+	if (!iod)
+		return -ENOMEM;
+	iod->cmd.common.opcode = opcode;
+	iod->cmd.common.command_id = (__force u16)cpu_to_le16(cid);
+	iod->cqe.status = cpu_to_le16(status << 1);
+	iod->cqe.result.u64 = result;
+	iod->completed = true;
+	list_add_tail(&iod->link, &vctrl->adm_list);
+	llist_add(&iod->done, &vctrl->adm_done);
+	return 0;
 }
 
 /*
@@ -251,6 +310,8 @@ unsigned int nvme_mdev_nvmet_reap_io(struct nvme_mdev_vctrl *vctrl)
 			     iod->sqid, cid, iod->cmd.common.opcode, status);
 
 		trace_nvme_mdev_io_complete(vctrl, iod->sqid, cid, status);
+		/* the data landed: dirty, before the guest learns about it */
+		nvme_mdev_dirty_mark_cmd(vctrl, &iod->cmd, iod->dirty);
 		if (test_bit(iod->sqid, vctrl->vsq_en))
 			nvme_mdev_vsq_cmd_done_io(vctrl, iod->sqid, cid, status,
 						  iod->cqe.result.u64);
@@ -500,7 +561,7 @@ static u16 nvme_mdev_nvmet_op_dbbuf_config(struct nvmet_ctrl *tctrl,
 		return NVME_SC_CMD_SEQ_ERROR | NVME_STATUS_DNR;
 
 	ret = nvme_mdev_mmio_enable_dbs_shadow(vctrl, dbbuf_addr,
-					       eventidx_addr);
+					       eventidx_addr, true);
 	return nvme_mdev_translate_error(ret);
 }
 
@@ -713,6 +774,7 @@ void nvme_mdev_nvmet_vctrl_init(struct nvme_mdev_vctrl *vctrl)
 	init_llist_head(&vctrl->io_done);
 	atomic_set(&vctrl->io_inflight, 0);
 	INIT_LIST_HEAD(&vctrl->io_list);
+	INIT_LIST_HEAD(&vctrl->adm_list);
 	INIT_WORK(&vctrl->adm_done_work, nvme_mdev_nvmet_adm_done_work);
 	INIT_WORK(&vctrl->nvmet_delete_work, nvme_mdev_nvmet_delete_work);
 	/* the instance's UUID, as the mdev core shows it */
@@ -731,8 +793,11 @@ void nvme_mdev_nvmet_vctrl_cleanup(struct nvme_mdev_vctrl *vctrl)
 
 	/* e.g. the Asynchronous Event Requests failed at the end */
 	list = llist_del_all(&vctrl->adm_done);
-	llist_for_each_entry_safe(iod, tmp, list, done)
+	llist_for_each_entry_safe(iod, tmp, list, done) {
+		list_del(&iod->link);
 		nvme_mdev_iod_free(iod);
+	}
+	WARN_ON(!list_empty(&vctrl->adm_list));
 	WARN_ON(!llist_empty(&vctrl->io_done));
 }
 

@@ -36,6 +36,8 @@ static int nvme_mdev_ops_init(struct vfio_device *vdev)
 			     mparent);
 	int ret;
 
+	/* (before the device is registered) */
+	nvme_mdev_mig_init(vctrl);
 	ret = nvme_mdev_vctrl_create(vctrl, mdev, hctrl);
 	if (ret)
 		return ret;
@@ -50,6 +52,7 @@ static int nvme_mdev_ops_init(struct vfio_device *vdev)
 static void nvme_mdev_ops_release(struct vfio_device *vdev)
 {
 	nvme_mdev_vctrl_destroy(vdev_to_vctrl(vdev));
+	nvme_mdev_mig_cleanup(vdev_to_vctrl(vdev));
 }
 
 /* Called when new mediated device is created */
@@ -93,6 +96,7 @@ static int nvme_mdev_ops_open(struct vfio_device *vdev)
 /* Called on the last close of the device */
 static void nvme_mdev_ops_close(struct vfio_device *vdev)
 {
+	nvme_mdev_mig_close(vdev_to_vctrl(vdev));
 	nvme_mdev_vctrl_release(vdev_to_vctrl(vdev));
 }
 
@@ -500,6 +504,8 @@ static long nvme_mdev_ops_ioctl(struct vfio_device *vdev, unsigned int cmd,
 	case VFIO_DEVICE_SET_IRQS:
 		return nvme_mdev_ioctl_set_irqs(vctrl, (void __user *)arg);
 	case VFIO_DEVICE_RESET:
+		/* (also back to RUNNING, for the migration state machine) */
+		nvme_mdev_mig_reset(vctrl);
 		nvme_mdev_vctrl_reset(vctrl);
 		return 0;
 	default:

@@ -54,7 +54,7 @@ int nvme_mdev_vsq_viommu_update(struct nvme_mdev_viommu *viommu,
 	data = nvme_mdev_udata_queue_vmap(viommu, q->iova,
 					  (unsigned int)q->size *
 					  sizeof(struct nvme_command),
-					  q->cont);
+					  q->cont, NULL);
 
 	q->data = IS_ERR(data) ? NULL : data;
 	return IS_ERR(data) ? PTR_ERR(data) : 0;

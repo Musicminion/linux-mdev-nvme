@@ -135,6 +135,8 @@ static void __exit nvme_mdev_exit(void)
 MODULE_AUTHOR("Maxim Levitsky <mlevitsk@redhat.com>");
 MODULE_DESCRIPTION("NVMe mediated VFIO virtual controller");
 MODULE_LICENSE("GPL");
+/* iova_bitmap_set(), for the dirty tracking (migration.c) */
+MODULE_IMPORT_NS("IOMMUFD");
 MODULE_VERSION(NVME_MDEV_FIRMWARE_VERSION);
 
 module_init(nvme_mdev_init)

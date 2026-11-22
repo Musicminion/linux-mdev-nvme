@@ -53,6 +53,7 @@ static int nvme_mdev_udata_iter_load_prplist(struct nvme_ext_data_iter *iter,
 	}
 
 	/* translate the entry to complete the setup*/
+	iter->iova = data_iova;
 	ret =  nvme_mdev_viommu_translate(iter->viommu, data_iova,
 					  &iter->physical, &iter->host_iova);
 	if (ret)
@@ -85,6 +86,7 @@ static int nvme_mdev_udata_iter_next_prplist(struct nvme_ext_data_iter *iter)
 		if (OFFSET_IN_PAGE(iova) != 0)
 			return -EINVAL;
 
+		iter->iova = iova;
 		ret  = nvme_mdev_viommu_translate(iter->viommu, iova,
 						  &iter->physical,
 						  &iter->host_iova);
@@ -127,6 +129,7 @@ static int nvme_mdev_udata_iter_next_dptr(struct nvme_ext_data_iter *iter)
 		 */
 		if (OFFSET_IN_PAGE(iova) != 0)
 			return -EINVAL;
+		iter->iova = iova;
 		return nvme_mdev_viommu_translate(iter->viommu, iova,
 						  &iter->physical,
 						  &iter->host_iova);
@@ -166,6 +169,7 @@ int nvme_mdev_udata_iter_set_dptr(struct nvme_ext_data_iter *it,
 
 	it->physical += page_offset;
 	it->host_iova += page_offset;
+	it->iova = prp1;
 	return 0;
 }
 
@@ -188,7 +192,8 @@ nvme_mdev_udata_iter_set_queue_prplist(struct nvme_mdev_viommu *viommu,
 static int nvme_mdev_queue_getpages_contiguous(struct nvme_mdev_viommu *viommu,
 					       dma_addr_t iova,
 					       struct page **pages,
-					       unsigned int npages)
+					       unsigned int npages,
+					       dma_addr_t *iovas)
 {
 	int ret;
 	unsigned int i;
@@ -203,6 +208,8 @@ static int nvme_mdev_queue_getpages_contiguous(struct nvme_mdev_viommu *viommu,
 		if (ret)
 			return ret;
 		pages[i] = pfn_to_page(PHYS_PFN(physical));
+		if (iovas)
+			iovas[i] = iova + PAGE_SIZE * i;
 	}
 	return 0;
 }
@@ -211,7 +218,8 @@ static int nvme_mdev_queue_getpages_contiguous(struct nvme_mdev_viommu *viommu,
 static int nvme_mdev_queue_getpages_prplist(struct nvme_mdev_viommu *viommu,
 					    dma_addr_t iova,
 					    struct page **pages,
-					    unsigned int npages)
+					    unsigned int npages,
+					    dma_addr_t *iovas)
 {
 	int ret, i = 0;
 	struct nvme_ext_data_iter uprpit;
@@ -223,6 +231,8 @@ static int nvme_mdev_queue_getpages_prplist(struct nvme_mdev_viommu *viommu,
 		return ret;
 
 	while (uprpit.count && i < npages) {
+		if (iovas)
+			iovas[i] = uprpit.iova;
 		pages[i++] = pfn_to_page(PHYS_PFN(uprpit.physical));
 		ret = uprpit.next(&uprpit);
 		if (ret)
@@ -231,11 +241,15 @@ static int nvme_mdev_queue_getpages_prplist(struct nvme_mdev_viommu *viommu,
 	return 0;
 }
 
-/* map a SQ/CQ queue to host physical memory */
+/*
+ * map a SQ/CQ queue to host physical memory; if it isn't contiguous,
+ * @page_iovas (if not NULL) gets the IOVA of each page
+ */
 void *nvme_mdev_udata_queue_vmap(struct nvme_mdev_viommu *viommu,
 				 dma_addr_t iova,
 				 unsigned int size,
-				 bool cont)
+				 bool cont,
+				 dma_addr_t *page_iovas)
 {
 	int ret;
 	unsigned int npages;
@@ -252,8 +266,10 @@ void *nvme_mdev_udata_queue_vmap(struct nvme_mdev_viommu *viommu,
 		return ERR_PTR(-ENOMEM);
 
 	ret = cont ?
-		nvme_mdev_queue_getpages_contiguous(viommu, iova, pages, npages)
-		: nvme_mdev_queue_getpages_prplist(viommu, iova, pages, npages);
+		nvme_mdev_queue_getpages_contiguous(viommu, iova, pages, npages,
+						    page_iovas)
+		: nvme_mdev_queue_getpages_prplist(viommu, iova, pages, npages,
+						   page_iovas);
 
 	if (ret) {
 		map = ERR_PTR(ret);
@@ -306,8 +322,10 @@ static u16 nvme_mdev_udata_map_prps(struct nvme_mdev_viommu *viommu,
 				    const union nvme_data_ptr *dptr, u32 len,
 				    struct sg_table *sgt,
 				    struct scatterlist *inline_sg,
-				    unsigned int inline_nents)
+				    unsigned int inline_nents,
+				    struct nvme_mdev_iova_ranges **rangesp)
 {
+	struct nvme_mdev_iova_ranges *ranges = NULL;
 	struct nvme_ext_data_iter it;
 	struct scatterlist *sg;
 	unsigned int nents, i;
@@ -319,8 +337,15 @@ static u16 nvme_mdev_udata_map_prps(struct nvme_mdev_viommu *viommu,
 		return nvme_mdev_translate_error(ret);
 
 	nents = it.count;
-	if (nvme_mdev_sgt_alloc(sgt, nents, inline_sg, inline_nents))
+	if (rangesp) {
+		ranges = nvme_mdev_iova_ranges_alloc(nents);
+		if (!ranges)
+			return NVME_SC_INTERNAL;
+	}
+	if (nvme_mdev_sgt_alloc(sgt, nents, inline_sg, inline_nents)) {
+		kfree(ranges);
 		return NVME_SC_INTERNAL;
+	}
 
 	for_each_sg(sgt->sgl, sg, nents, i) {
 		unsigned int offset = OFFSET_IN_PAGE(it.physical);
@@ -328,15 +353,20 @@ static u16 nvme_mdev_udata_map_prps(struct nvme_mdev_viommu *viommu,
 
 		sg_set_page(sg, pfn_to_page(PHYS_PFN(it.physical)), seg,
 			    offset);
+		if (ranges)
+			nvme_mdev_iova_ranges_add(ranges, it.iova, seg);
 		len -= seg;
 
 		ret = it.next(&it);
 		if (ret) {
 			nvme_mdev_udata_unmap_sg(sgt, inline_sg);
+			kfree(ranges);
 			return nvme_mdev_translate_error(ret);
 		}
 	}
 	WARN_ON_ONCE(len);
+	if (rangesp)
+		*rangesp = ranges;
 	return NVME_SC_SUCCESS;
 }
 
@@ -456,8 +486,10 @@ static u16 nvme_mdev_udata_map_sgl(struct nvme_mdev_viommu *viommu,
 				   const struct nvme_sgl_desc *sgl, u32 len,
 				   struct sg_table *sgt,
 				   struct scatterlist *inline_sg,
-				   unsigned int inline_nents)
+				   unsigned int inline_nents,
+				   struct nvme_mdev_iova_ranges **rangesp)
 {
+	struct nvme_mdev_iova_ranges *ranges = NULL;
 	struct nvme_mdev_sgl_block *blocks;
 	unsigned int nr, nents = 0, i;
 	struct scatterlist *sg;
@@ -485,6 +517,13 @@ static u16 nvme_mdev_udata_map_sgl(struct nvme_mdev_viommu *viommu,
 		goto out;
 	}
 
+	if (rangesp) {
+		ranges = nvme_mdev_iova_ranges_alloc(nents);
+		if (!ranges) {
+			status = NVME_SC_INTERNAL;
+			goto out;
+		}
+	}
 	if (nvme_mdev_sgt_alloc(sgt, nents, inline_sg, inline_nents)) {
 		status = NVME_SC_INTERNAL;
 		goto out;
@@ -513,6 +552,8 @@ static u16 nvme_mdev_udata_map_sgl(struct nvme_mdev_viommu *viommu,
 			}
 			sg_set_page(sg, pfn_to_page(PHYS_PFN(physical)), seg,
 				    offset);
+			if (ranges)
+				nvme_mdev_iova_ranges_add(ranges, addr, seg);
 			sg = sg_next(sg);
 			addr += seg;
 			left -= seg;
@@ -520,6 +561,10 @@ static u16 nvme_mdev_udata_map_sgl(struct nvme_mdev_viommu *viommu,
 	}
 out:
 	kvfree(blocks);
+	if (status)
+		kfree(ranges);
+	else if (rangesp)
+		*rangesp = ranges;
 	return status;
 }
 
@@ -532,12 +577,14 @@ out:
 u16 nvme_mdev_udata_map_sg(struct nvme_mdev_viommu *viommu,
 			   const struct nvme_command *cmd, u32 len,
 			   struct sg_table *sgt, struct scatterlist *inline_sg,
-			   unsigned int inline_nents)
+			   unsigned int inline_nents,
+			   struct nvme_mdev_iova_ranges **ranges)
 {
+	/* @ranges: dirty logging, the guest memory ranges of the data */
 	if (cmd->common.flags & NVME_CMD_SGL_ALL)
 		return nvme_mdev_udata_map_sgl(viommu, &cmd->common.dptr.sgl,
 					       len, sgt, inline_sg,
-					       inline_nents);
+					       inline_nents, ranges);
 	return nvme_mdev_udata_map_prps(viommu, &cmd->common.dptr, len, sgt,
-					inline_sg, inline_nents);
+					inline_sg, inline_nents, ranges);
 }

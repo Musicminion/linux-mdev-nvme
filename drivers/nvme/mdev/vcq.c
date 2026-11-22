@@ -21,6 +21,7 @@ int nvme_mdev_vcq_init(struct nvme_mdev_vctrl *vctrl, u16 qid,
 	q->iova = iova;
 	q->cont = cont;
 	q->data = NULL;
+	q->page_iovas = NULL;
 	q->qid = qid;
 	q->size = size;
 	q->tail = 0;
@@ -43,22 +44,42 @@ int nvme_mdev_vcq_init(struct nvme_mdev_vctrl *vctrl, u16 qid,
 	return 0;
 }
 
-/* Update the kernel mapping of the queue */
+/*
+ * Update the kernel mapping of the queue; one that isn't contiguous also
+ * gets the IOVAs of its pages, for dirty tracking
+ */
 int nvme_mdev_vcq_viommu_update(struct nvme_mdev_viommu *viommu,
 				struct nvme_vcq *q)
 {
+	unsigned int size = (unsigned int)q->size *
+			    sizeof(struct nvme_completion);
+	dma_addr_t *iovas = NULL;
 	void *data;
 
+	/* (what we wrote there may not have been reported yet) */
+	nvme_mdev_dirty_mark_vcq(viommu->vctrl, q);
 	if (q->data)
 		vunmap(q->data);
+	q->data = NULL;
+	kfree(q->page_iovas);
+	q->page_iovas = NULL;
 
-	data = nvme_mdev_udata_queue_vmap(viommu, q->iova,
-					  (unsigned int)q->size *
-					  sizeof(struct nvme_completion),
-					  q->cont);
+	if (!q->cont) {
+		iovas = kcalloc(DIV_ROUND_UP(size, PAGE_SIZE), sizeof(*iovas),
+				GFP_KERNEL);
+		if (!iovas)
+			return -ENOMEM;
+	}
 
-	q->data = IS_ERR(data) ? NULL : data;
-	return IS_ERR(data) ? PTR_ERR(data) : 0;
+	data = nvme_mdev_udata_queue_vmap(viommu, q->iova, size, q->cont,
+					  iovas);
+	if (IS_ERR(data)) {
+		kfree(iovas);
+		return PTR_ERR(data);
+	}
+	q->data = data;
+	q->page_iovas = iovas;
+	return 0;
 }
 
 /* Delete a virtual completion queue */
@@ -68,9 +89,12 @@ void nvme_mdev_vcq_delete(struct nvme_mdev_vctrl *vctrl, u16 qid)
 
 	lockdep_assert_held(&vctrl->lock);
 
+	nvme_mdev_dirty_mark_vcq(vctrl, q);
 	if (q->data)
 		vunmap(q->data);
 	q->data = NULL;
+	kfree(q->page_iovas);
+	q->page_iovas = NULL;
 
 	_DBG(vctrl, "VCQ: delete qid=%d\n", q->qid);
 	clear_bit(qid, vctrl->vcq_en);

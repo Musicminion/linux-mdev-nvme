@@ -92,7 +92,8 @@ static void nvme_mdev_mmio_db_write_sq(struct nvme_mdev_vctrl *vctrl,
 	if (qid != 0)
 		WRITE_ONCE(vctrl->io_idle, false);
 
-	if (vctrl->vctrl_paused || !vctrl->mmio.shadow_db_supported)
+	if (vctrl->vctrl_paused || vctrl->mig_stopped ||
+	    !vctrl->mmio.shadow_db_supported)
 		return;
 
 	qid ? nvme_mdev_io_resume(vctrl) : nvme_mdev_adm_process_sq(vctrl);
@@ -120,7 +121,8 @@ static void nvme_mdev_mmio_db_write_cq(struct nvme_mdev_vctrl *vctrl,
 	if (!vctrl->mmio.shadow_db_en || qid == 0)
 		WRITE_ONCE(vctrl->mmio.dbs[qid].cqh, cpu_to_le32(val & 0xFFFF));
 
-	if (vctrl->vctrl_paused || !vctrl->mmio.shadow_db_supported)
+	if (vctrl->vctrl_paused || vctrl->mig_stopped ||
+	    !vctrl->mmio.shadow_db_supported)
 		return;
 
 	if (qid == 0) {
@@ -536,10 +538,15 @@ int nvme_mdev_mmio_enable_dbs(struct nvme_mdev_vctrl *vctrl)
 	return 0;
 }
 
-/* Called when the virtual controller shadow doorbell is enabled */
+/*
+ * Called when the virtual controller shadow doorbell is enabled: @sync
+ * initializes the guest's buffers with the doorbell values we have (not
+ * when migrating them in, they are what the guest has).
+ */
 int nvme_mdev_mmio_enable_dbs_shadow(struct nvme_mdev_vctrl *vctrl,
 				     dma_addr_t sdb_iova,
-				     dma_addr_t eidx_iova)
+				     dma_addr_t eidx_iova,
+				     bool sync)
 {
 	int ret;
 
@@ -561,8 +568,11 @@ int nvme_mdev_mmio_enable_dbs_shadow(struct nvme_mdev_vctrl *vctrl,
 	vctrl->mmio.dbs = vctrl->mmio.sdb_map.kmap;
 	vctrl->mmio.eidxs = vctrl->mmio.seidx_map.kmap;
 
-	memcpy(vctrl->mmio.dbs, vctrl->mmio.db_page_kmap, DB_AREA_SIZE);
-	memcpy(vctrl->mmio.eidxs, vctrl->mmio.db_page_kmap, DB_AREA_SIZE);
+	if (sync) {
+		memcpy(vctrl->mmio.dbs, vctrl->mmio.db_page_kmap, DB_AREA_SIZE);
+		memcpy(vctrl->mmio.eidxs, vctrl->mmio.db_page_kmap,
+		       DB_AREA_SIZE);
+	}
 
 	vctrl->mmio.shadow_db_en = true;
 	return 0;
@@ -577,6 +587,7 @@ void nvme_mdev_mmio_viommu_update(struct nvme_mdev_vctrl *vctrl)
 	if (!vctrl->mmio.shadow_db_en)
 		return;
 
+	nvme_mdev_dirty_mark_shadow_dbs(vctrl);
 	nvme_mdev_viommu_update_kmap(&vctrl->viommu, &vctrl->mmio.sdb_map);
 	nvme_mdev_viommu_update_kmap(&vctrl->viommu, &vctrl->mmio.seidx_map);
 
@@ -589,6 +600,8 @@ void nvme_mdev_mmio_disable_dbs(struct nvme_mdev_vctrl *vctrl)
 {
 	nvme_mdev_assert_io_not_running(vctrl);
 
+	/* (what we wrote there may not have been reported yet) */
+	nvme_mdev_dirty_mark_shadow_dbs(vctrl);
 	/* Free the shadow doorbells */
 	nvme_mdev_viommu_free_kmap(&vctrl->viommu, &vctrl->mmio.sdb_map);
 	nvme_mdev_viommu_free_kmap(&vctrl->viommu, &vctrl->mmio.seidx_map);

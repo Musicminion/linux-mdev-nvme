@@ -36,6 +36,7 @@ struct nvme_ext_data_iter {
 	u64		count;	/* number of data pages, yet to be covered */
 
 	phys_addr_t	physical; /* iterator physical address value*/
+	dma_addr_t	iova;	/* the guest's address of it */
 	dma_addr_t	host_iova; /* iterator dma address value*/
 
 	/* moves iterator to the next item */
