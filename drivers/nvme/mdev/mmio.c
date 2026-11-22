@@ -6,6 +6,7 @@
 #include <linux/kernel.h>
 #include <linux/highmem.h>
 #include "priv.h"
+#include "trace.h"
 
 #define DB_AREA_SIZE (MAX_VIRTUAL_QUEUES * 2 * (4 << DB_STRIDE_SHIFT))
 #define DB_MASK ((4 << DB_STRIDE_SHIFT) - 1)
@@ -373,6 +374,7 @@ static int nvme_mdev_mmio_bar_access(struct nvme_mdev_vctrl *vctrl,
 		if (nvme_mdev_vctrl_is_dead(vctrl))
 			goto drop;
 
+		trace_nvme_mdev_doorbell(vctrl, qid, sq, val);
 		sq ? nvme_mdev_mmio_db_write_sq(vctrl, qid, val) :
 		     nvme_mdev_mmio_db_write_cq(vctrl, qid, val);
 		break;

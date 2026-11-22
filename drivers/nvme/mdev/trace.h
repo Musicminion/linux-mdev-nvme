@@ -75,6 +75,32 @@ TRACE_EVENT(nvme_mdev_irq,
 	TP_printk("%s vector=%u", __get_str(dev), __entry->vector)
 );
 
+/*
+ * A doorbell write that trapped (a VM exit and a trip through the VFIO
+ * region).  With shadow doorbells the guest writes the shadow buffer
+ * instead and rings the real doorbell only when we ask it to through the
+ * event index, i.e. when the I/O thread went idle: during I/O this should
+ * stay rare.
+ */
+TRACE_EVENT(nvme_mdev_doorbell,
+	TP_PROTO(struct nvme_mdev_vctrl *vctrl, u16 qid, bool sq, u32 value),
+	TP_ARGS(vctrl, qid, sq, value),
+	TP_STRUCT__entry(
+		__string(dev, dev_name(mdev_dev(vctrl->mdev)))
+		__field(u16, qid)
+		__field(bool, sq)
+		__field(u32, value)
+	),
+	TP_fast_assign(
+		__assign_str(dev);
+		__entry->qid = qid;
+		__entry->sq = sq;
+		__entry->value = value;
+	),
+	TP_printk("%s %s qid=%u value=%u", __get_str(dev),
+		  __entry->sq ? "sq" : "cq", __entry->qid, __entry->value)
+);
+
 #endif /* _TRACE_NVME_MDEV_H */
 
 #undef TRACE_INCLUDE_PATH
