@@ -50,22 +50,29 @@ static const struct vm_operations_struct nvme_mdev_mmio_dbs_vm_ops = {
 	.fault = nvme_mdev_mmio_dbs_mmap_fault,
 };
 
-/* check that user db write is valid and send an error if not*/
-bool nvme_mdev_mmio_db_check(struct nvme_mdev_vctrl *vctrl,
-			     u16 qid, u16 size, u16 db)
+/* the guest wrote an invalid doorbell value: an error */
+void nvme_mdev_mmio_db_invalid(struct nvme_mdev_vctrl *vctrl,
+			       u16 qid, u16 size, u16 db)
 {
-	if (db < size)
-		return true;
 	if (qid == 0) {
 		_DBG(vctrl, "MMIO: invalid admin DB write - fatal error\n");
 		nvme_mdev_mmio_fatal_error(vctrl);
-		return false;
+		return;
 	}
 
 	_DBG(vctrl, "MMIO: invalid DB value write qid=%d, size=%d, value=%d\n",
 	     qid, size, db);
 
 	nvme_mdev_mmio_error(vctrl, NVME_AER_ERROR_INVALID_DB_VALUE);
+}
+
+/* check that user db write is valid and send an error if not*/
+bool nvme_mdev_mmio_db_check(struct nvme_mdev_vctrl *vctrl,
+			     u16 qid, u16 size, u16 db)
+{
+	if (db < size)
+		return true;
+	nvme_mdev_mmio_db_invalid(vctrl, qid, size, db);
 	return false;
 }
 
