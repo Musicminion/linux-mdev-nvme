@@ -73,6 +73,11 @@ static int nvme_mdev_io_translate_rw(struct io_ctx *ctx)
 	if (!check_range(slba, length, ctx->ns->ns_size))
 		return DNR(NVME_SC_LBA_RANGE);
 
+	/* no more data than MDTS (in units of 4K, the minimum page size) */
+	if (ctx->hctrl->mdts &&
+	    (length << ctx->ns->blksize_shift) > (4096ULL << ctx->hctrl->mdts))
+		return DNR(NVME_SC_INVALID_FIELD);
+
 	ctx->out.rw.slba = in->slba;
 	ctx->out.rw.length = in->length;
 
@@ -412,6 +417,7 @@ static void nvme_mdev_io_polling_loop(struct io_ctx *ctx)
 	bool irq_mode = nvme_mdev_io_irq_mode(vctrl);
 	bool pending_io;
 	unsigned int work;
+	ktime_t wait_start;
 	int n;
 
 	hsqcnt = nvme_mdev_vctrl_hqs_list(vctrl, hsqs);
@@ -494,18 +500,18 @@ static void nvme_mdev_io_polling_loop(struct io_ctx *ctx)
 		cond_resched();
 	}
 
-	/* Drain the host IO */
+	/*
+	 * Drain the host I/O, whatever the guest did (killed the controller,
+	 * say): the bios use the guest's pages, which must stay pinned, and
+	 * their host queue, which our callers free next.  They all complete
+	 * (the host driver times them out at worst); a polled one only when
+	 * we poll it.
+	 */
+	wait_start = ktime_get();
 	for (;;) {
 		bool pending_io = false;
 
 		vctrl->now = ktime_get();
-
-		/* nothing to wait for if the guest killed the controller */
-		if (nvme_mdev_vctrl_is_dead(vctrl)) {
-			idle = false;
-			break;
-		}
-
 		for (i = 0; i < hsqcnt; i++) {
 			int n = nvme_mdev_io_process_hwq(ctx, hsqs[i]);
 
@@ -518,15 +524,11 @@ static void nvme_mdev_io_polling_loop(struct io_ctx *ctx)
 		if (!pending_io)
 			break;
 
+		if (timeout(wait_start, vctrl->now, NVME_MDEV_IO_TIMEOUT_MS)) {
+			_WARN(ctx->vctrl, "IO: still waiting for host I/O\n");
+			wait_start = vctrl->now;
+		}
 		cond_resched();
-
-		if (!timeout(ctx->last_io_t, vctrl->now,
-			     NVME_MDEV_IO_TIMEOUT_MS))
-			continue;
-
-		_WARN(ctx->vctrl, "IO: skipping flush - host IO timeout\n");
-		idle = false;
-		break;
 	}
 
 	/*
