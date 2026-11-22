@@ -192,6 +192,16 @@ config BLK_SED_OPAL
 	Enabling this option enables users to setup/unlock/lock
 	Locking ranges for SED devices using the Opal protocol.
 
+config BLK_DMA_PREMAP
+	bool
+	help
+	  DMA pre-mapping: a submitter that keeps the same pages around for
+	  I/O (e.g. a guest's memory) maps them for DMA once, for the device
+	  of a block device, and tags its bios with that mapping.  Drivers
+	  that map their requests with blk_rq_dma_map_iter_start() then use
+	  the existing DMA addresses instead of mapping and unmapping the
+	  pages for every request.  Selected by the users.
+
 config BLK_INLINE_ENCRYPTION
 	bool "Enable inline encryption support in block layer"
 	help

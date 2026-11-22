@@ -27,6 +27,36 @@ struct blk_dma_iter {
 
 bool blk_rq_dma_map_iter_start(struct request *req, struct device *dma_dev,
 		struct dma_iova_state *state, struct blk_dma_iter *iter);
+
+/*
+ * DMA pre-mapping: pages mapped for DMA once, for the device of a block
+ * device, by a submitter that does I/O to them over and over; its bios
+ * tagged with bio_set_premap() are mapped page by page from there, and
+ * not unmapped after the I/O.  The submitter keeps the pages in the
+ * mapping while it has I/O in flight to them.
+ */
+struct blk_dma_premap;
+#ifdef CONFIG_BLK_DMA_PREMAP
+struct blk_dma_premap *blk_dma_premap_alloc(struct block_device *bdev);
+void blk_dma_premap_free(struct blk_dma_premap *pm);
+int blk_dma_premap_add(struct blk_dma_premap *pm, struct page **pages,
+		unsigned int nr);
+void blk_dma_premap_remove(struct blk_dma_premap *pm, struct page **pages,
+		unsigned int nr);
+bool blk_dma_premap_lookup(struct blk_dma_premap *pm, phys_addr_t paddr,
+		dma_addr_t *dma);
+bool bio_set_premap(struct bio *bio, struct blk_dma_premap *pm);
+
+static inline bool blk_rq_premapped(struct request *req)
+{
+	return req->bio && req->bio->bi_premap;
+}
+#else
+static inline bool blk_rq_premapped(struct request *req)
+{
+	return false;
+}
+#endif
 bool blk_rq_dma_map_iter_next(struct request *req, struct device *dma_dev,
 		struct dma_iova_state *state, struct blk_dma_iter *iter);
 
@@ -71,8 +101,10 @@ static inline bool blk_dma_unmap(struct request *req, struct device *dma_dev,
 static inline bool blk_rq_dma_unmap(struct request *req, struct device *dma_dev,
 		struct dma_iova_state *state, size_t mapped_len)
 {
+	/* (pre-mapped: nothing to unmap either) */
 	return blk_dma_unmap(req, dma_dev, state, mapped_len,
-				req->cmd_flags & REQ_P2PDMA);
+				(req->cmd_flags & REQ_P2PDMA) ||
+				blk_rq_premapped(req));
 }
 
 #endif /* BLK_MQ_DMA_H */

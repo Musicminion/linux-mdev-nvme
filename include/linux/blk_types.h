@@ -15,6 +15,7 @@
 struct bio_set;
 struct bio;
 struct bio_integrity_payload;
+struct blk_dma_premap;
 struct page;
 struct io_context;
 struct cgroup_subsys_state;
@@ -263,6 +264,10 @@ struct bio {
 
 #if defined(CONFIG_BLK_DEV_INTEGRITY)
 	struct bio_integrity_payload *bi_integrity; /* data integrity */
+#endif
+#ifdef CONFIG_BLK_DMA_PREMAP
+	/* the data pages are mapped for DMA there, see bio_set_premap() */
+	struct blk_dma_premap	*bi_premap;
 #endif
 
 	unsigned short		bi_vcnt;	/* how many bio_vec's */

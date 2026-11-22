@@ -41,6 +41,13 @@ static bool blk_map_iter_next(struct request *req, struct blk_map_iter *iter,
 	bv = mp_bvec_iter_bvec(iter->bvecs, iter->iter);
 	vec->paddr = bvec_phys(&bv);
 	max_size = get_max_segment_size(&req->q->limits, vec->paddr, UINT_MAX);
+	/*
+	 * Pre-mapped pages are mapped one by one, their DMA addresses
+	 * needn't be contiguous: a segment doesn't cross a page.
+	 */
+	if (!iter->is_integrity && blk_rq_premapped(req))
+		max_size = min_t(unsigned int, max_size,
+				 PAGE_SIZE - offset_in_page(vec->paddr));
 	bv.bv_len = min(bv.bv_len, max_size);
 	bvec_iter_advance_single(iter->bvecs, &iter->iter, bv.bv_len);
 
@@ -88,6 +95,27 @@ static bool blk_dma_map_bus(struct blk_dma_iter *iter, struct phys_vec *vec)
 	iter->len = vec->len;
 	return true;
 }
+
+#ifdef CONFIG_BLK_DMA_PREMAP
+/* a segment of a request whose pages are pre-mapped (in one page) */
+static bool blk_dma_map_premapped(struct request *req,
+		struct blk_dma_iter *iter, struct phys_vec *vec)
+{
+	if (WARN_ON_ONCE(!blk_dma_premap_lookup(req->bio->bi_premap,
+						vec->paddr, &iter->addr))) {
+		iter->status = BLK_STS_INVAL;
+		return false;
+	}
+	iter->len = vec->len;
+	return true;
+}
+#else
+static bool blk_dma_map_premapped(struct request *req,
+		struct blk_dma_iter *iter, struct phys_vec *vec)
+{
+	return false;
+}
+#endif
 
 static bool blk_dma_map_direct(struct request *req, struct device *dma_dev,
 		struct blk_dma_iter *iter, struct phys_vec *vec)
@@ -169,6 +197,12 @@ static bool blk_dma_map_iter_start(struct request *req, struct device *dma_dev,
 	 */
 	if (!blk_map_iter_next(req, &iter->iter, &vec))
 		return false;
+
+	/* pre-mapped: no IOVA allocation, nothing to unmap */
+	if (!iter->iter.is_integrity && blk_rq_premapped(req)) {
+		memset(state, 0, sizeof(*state));
+		return blk_dma_map_premapped(req, iter, &vec);
+	}
 
 	switch (pci_p2pdma_state(&iter->p2pdma, dma_dev,
 				 phys_to_page(vec.paddr))) {
@@ -254,6 +288,8 @@ bool blk_rq_dma_map_iter_next(struct request *req, struct device *dma_dev,
 	if (!blk_map_iter_next(req, &iter->iter, &vec))
 		return false;
 
+	if (blk_rq_premapped(req))
+		return blk_dma_map_premapped(req, iter, &vec);
 	if (iter->p2pdma.map == PCI_P2PDMA_MAP_BUS_ADDR)
 		return blk_dma_map_bus(iter, &vec);
 	return blk_dma_map_direct(req, dma_dev, iter, &vec);

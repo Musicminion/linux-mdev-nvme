@@ -552,6 +552,13 @@ struct blk_mq_tag_set {
 	struct srcu_struct	tags_srcu;
 
 	struct rw_semaphore	update_nr_hwq_lock;
+
+	/*
+	 * The device that does the DMA of the requests, if the driver maps
+	 * them with blk_rq_dma_map_iter_start(): DMA pre-mapping
+	 * (blk_dma_premap_alloc()) maps pages for it.
+	 */
+	struct device		*dma_dev;
 };
 
 /**

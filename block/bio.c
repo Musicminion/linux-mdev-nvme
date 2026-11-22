@@ -275,6 +275,9 @@ void bio_init(struct bio *bio, struct block_device *bdev, struct bio_vec *table,
 #ifdef CONFIG_BLK_DEV_INTEGRITY
 	bio->bi_integrity = NULL;
 #endif
+#ifdef CONFIG_BLK_DMA_PREMAP
+	bio->bi_premap = NULL;
+#endif
 	bio->bi_vcnt = 0;
 
 	atomic_set(&bio->__bi_remaining, 1);
@@ -846,6 +849,10 @@ static int __bio_clone(struct bio *bio, struct bio *bio_src, gfp_t gfp)
 
 	if (bio_crypt_clone(bio, bio_src, gfp) < 0)
 		return -ENOMEM;
+#ifdef CONFIG_BLK_DMA_PREMAP
+	/* (a split of it: the same pages) */
+	bio->bi_premap = bio_src->bi_premap;
+#endif
 	if (bio_integrity(bio_src) &&
 	    bio_integrity_clone(bio, bio_src, gfp) < 0)
 		return -ENOMEM;
