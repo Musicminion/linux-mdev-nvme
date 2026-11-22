@@ -127,3 +127,5 @@ config NVME_TARGET_PCI_EPF
 	  capable PCI controller.
 
 	  If unsure, say N.
+
+source "drivers/nvme/target/mdev/Kconfig"

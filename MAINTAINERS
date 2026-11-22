@@ -18531,6 +18531,14 @@ W:	http://git.infradead.org/nvme.git
 T:	git git://git.infradead.org/nvme.git
 F:	drivers/nvme/target/
 
+NVM EXPRESS TARGET MEDIATED VFIO DEVICE (nvme-mdev)
+M:	Musicminion <ayaka@outlook.in>
+L:	linux-nvme@lists.infradead.org
+L:	kvm@vger.kernel.org
+S:	Maintained
+F:	Documentation/ABI/testing/sysfs-bus-mdev-nvme
+F:	drivers/nvme/target/mdev/
+
 NVMEM FRAMEWORK
 M:	Srinivas Kandagatla <srini@kernel.org>
 S:	Maintained

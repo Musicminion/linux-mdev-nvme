@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
-config NVME_MDEV_VFIO
-	tristate "NVMe mediated VFIO virtual controller (EXPERIMENTAL)"
+config NVME_TARGET_MDEV
+	tristate "NVMe target mediated VFIO device for guests (EXPERIMENTAL)"
 	depends on NVME_TARGET && VFIO && 64BIT
 	select VFIO_MDEV
 	select VHOST_TASK

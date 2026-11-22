@@ -20,7 +20,7 @@
 #include <linux/workqueue.h>
 #include <linux/llist.h>
 #include <linux/byteorder/generic.h>
-#include "../target/nvmet.h"
+#include "../nvmet.h"
 #include "spec.h"
 #include "mdev.h"
 
