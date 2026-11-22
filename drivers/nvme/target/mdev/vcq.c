@@ -71,7 +71,7 @@ int nvme_mdev_vcq_viommu_update(struct nvme_mdev_viommu *viommu,
 			return -ENOMEM;
 	}
 
-	data = nvme_mdev_udata_queue_vmap(viommu, q->iova, size, q->cont,
+	data = nvme_mdev_udata_queue_vmap(viommu, q->iova, size, q->cont, true,
 					  iovas);
 	if (IS_ERR(data)) {
 		kfree(iovas);

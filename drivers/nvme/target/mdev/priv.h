@@ -596,11 +596,12 @@ void nvme_mdev_udata_iter_setup(struct nvme_mdev_viommu *viommu,
 				struct nvme_ext_data_iter *iter);
 
 int nvme_mdev_udata_iter_set_dptr(struct nvme_ext_data_iter *it,
-				  const union nvme_data_ptr *dptr, u64 size);
+				  const union nvme_data_ptr *dptr, u64 size,
+				  bool write);
 
 void *nvme_mdev_udata_queue_vmap(struct nvme_mdev_viommu *viommu,
 				 dma_addr_t iova,
-				 unsigned int size, bool cont,
+				 unsigned int size, bool cont, bool write,
 				 dma_addr_t *page_iovas);
 
 u16 nvme_mdev_udata_map_sg(struct nvme_mdev_viommu *viommu,
@@ -622,12 +623,13 @@ void nvme_mdev_viommu_block_range(struct nvme_mdev_viommu *viommu,
 void nvme_mdev_viommu_unblock_range(struct nvme_mdev_viommu *viommu);
 
 int nvme_mdev_viommu_translate(struct nvme_mdev_viommu *viommu,
-			       dma_addr_t iova,
+			       dma_addr_t iova, bool write,
 			       dma_addr_t *physical,
 			       dma_addr_t *host_iova);
 
 int nvme_mdev_viommu_create_kmap(struct nvme_mdev_viommu *viommu,
-				 dma_addr_t iova, struct page_map *page);
+				 dma_addr_t iova, bool write,
+				 struct page_map *page);
 
 void nvme_mdev_viommu_free_kmap(struct nvme_mdev_viommu *viommu,
 				struct page_map *page);
