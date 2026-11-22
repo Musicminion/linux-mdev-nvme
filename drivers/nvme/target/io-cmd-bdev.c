@@ -182,6 +182,8 @@ static void nvmet_bio_done(struct bio *bio)
 	struct nvmet_req *req = bio->bi_private;
 	blk_status_t blk_status = bio->bi_status;
 
+	/* before the bio can be freed, see nvmet_req_poll() */
+	WRITE_ONCE(req->poll_bio, NULL);
 	nvmet_req_bio_put(req, bio);
 	nvmet_req_complete(req, blk_to_nvme_status(req, blk_status));
 }
@@ -239,6 +241,49 @@ static int nvmet_bdev_alloc_bip(struct nvmet_req *req, struct bio *bio,
 }
 #endif /* CONFIG_BLK_DEV_INTEGRITY */
 
+/*
+ * Submit a read or write as a polled bio if the transport reaps its
+ * completions with nvmet_req_poll() and the device can poll.  Only if it
+ * fits into a single bio, which is the one polled (the block layer still
+ * clears REQ_POLLED if it has to split it, and it then completes from
+ * interrupt context as usual).
+ */
+static bool nvmet_bdev_use_polled_io(struct nvmet_req *req)
+{
+	if (!(req->ops->flags & NVMF_POLLED_IO) || req->metadata_len)
+		return false;
+	if (!(bdev_get_queue(req->ns->bdev)->limits.features & BLK_FEAT_POLL))
+		return false;
+	return req->sg_cnt <= (nvmet_use_inline_bvec(req) ?
+			       NVMET_MAX_INLINE_BIOVEC : BIO_MAX_VECS);
+}
+
+/**
+ * nvmet_req_poll - poll for the completion of a request
+ * @req: the request
+ * @flags: BLK_POLL_* flags
+ *
+ * For transports with NVMF_POLLED_IO: polls the queue the request's bio
+ * went to, if it is a polled one still in flight, which completes the
+ * request (->queue_response) if it is done, and maybe others on the same
+ * queue.  Returns the number of completions found.  The caller makes sure
+ * that @req itself isn't freed meanwhile.
+ */
+int nvmet_req_poll(struct nvmet_req *req, unsigned int flags)
+{
+	struct bio *bio;
+	int ret = 0;
+
+	/* (the bio may complete and be freed meanwhile, see bio_poll()) */
+	rcu_read_lock();
+	bio = READ_ONCE(req->poll_bio);
+	if (bio)
+		ret = bio_poll(bio, NULL, flags);
+	rcu_read_unlock();
+	return ret;
+}
+EXPORT_SYMBOL_GPL(nvmet_req_poll);
+
 static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 {
 	unsigned int sg_cnt = req->sg_cnt;
@@ -275,6 +320,9 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 
 	if (is_pci_p2pdma_page(sg_page(req->sg)))
 		opf |= REQ_NOMERGE;
+
+	if (nvmet_bdev_use_polled_io(req))
+		opf |= REQ_POLLED;
 
 	sector = nvmet_lba_to_sect(req->ns, req->cmd->rw.slba);
 
@@ -329,6 +377,9 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 		}
 	}
 
+	/* set before it can complete; nvmet_bio_done() clears it */
+	if (opf & REQ_POLLED)
+		WRITE_ONCE(req->poll_bio, bio);
 	submit_bio(bio);
 out_plug:
 	blk_finish_plug(&plug);

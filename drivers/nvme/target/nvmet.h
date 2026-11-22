@@ -420,6 +420,12 @@ struct nvmet_fabrics_ops {
 	unsigned int flags;
 #define NVMF_KEYED_SGLS			(1 << 0)
 #define NVMF_METADATA_SUPPORTED		(1 << 1)
+/*
+ * The transport reaps the completions of block device reads and writes
+ * with nvmet_req_poll(): they are submitted as polled bios where the
+ * device can poll.
+ */
+#define NVMF_POLLED_IO			(1 << 2)
 	void (*queue_response)(struct nvmet_req *req);
 	int (*add_port)(struct nvmet_port *port);
 	void (*remove_port)(struct nvmet_port *port);
@@ -490,6 +496,8 @@ struct nvmet_req {
 	};
 	int			sg_cnt;
 	int			metadata_sg_cnt;
+	/* a polled bio in flight, see NVMF_POLLED_IO */
+	struct bio		*poll_bio;
 	/* data length as parsed from the SGL descriptor: */
 	size_t			transfer_len;
 	size_t			metadata_len;
@@ -575,6 +583,7 @@ u32 nvmet_fabrics_io_cmd_data_len(struct nvmet_req *req);
 bool nvmet_req_init(struct nvmet_req *req, struct nvmet_sq *sq,
 		const struct nvmet_fabrics_ops *ops);
 void nvmet_req_uninit(struct nvmet_req *req);
+int nvmet_req_poll(struct nvmet_req *req, unsigned int flags);
 size_t nvmet_req_transfer_len(struct nvmet_req *req);
 bool nvmet_check_transfer_len(struct nvmet_req *req, size_t len);
 bool nvmet_check_data_len_lte(struct nvmet_req *req, size_t data_len);

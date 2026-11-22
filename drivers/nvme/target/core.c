@@ -1162,6 +1162,7 @@ bool nvmet_req_init(struct nvmet_req *req, struct nvmet_sq *sq,
 	req->metadata_sg = NULL;
 	req->sg_cnt = 0;
 	req->metadata_sg_cnt = 0;
+	req->poll_bio = NULL;
 	req->transfer_len = 0;
 	req->metadata_len = 0;
 	req->cqe->result.u64 = 0;
