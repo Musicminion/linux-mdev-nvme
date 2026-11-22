@@ -140,8 +140,12 @@ void nvme_mdev_vcq_process(struct nvme_mdev_vctrl *vctrl, u16 qid,
 bool nvme_mdev_vcq_flush(struct nvme_mdev_vctrl *vctrl, u16 qid)
 {
 	struct nvme_vcq *q = &vctrl->vcqs[qid];
-	u16 new_head = le32_to_cpu(READ_ONCE(vctrl->mmio.dbs[qid].cqh));
+	u16 new_head;
 
+	/* (the shadow doorbells may have been unmapped meanwhile) */
+	if (!vctrl->mmio.dbs)
+		return false;
+	new_head = le32_to_cpu(READ_ONCE(vctrl->mmio.dbs[qid].cqh));
 	if (new_head == q->tail || q->irq == -1)
 		return false;
 
