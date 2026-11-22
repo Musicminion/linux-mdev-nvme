@@ -62,3 +62,17 @@ Description:
 		without seeing any I/O before it goes idle and waits for a
 		doorbell write; 0 means it never goes idle.  500 by default,
 		at most 60000.  Only used with shadow doorbells.
+
+What:		/sys/bus/mdev/devices/<uuid>/settings/interrupt_mode
+Date:		November 2026
+Contact:	linux-nvme@lists.infradead.org
+Description:
+		(RW) 1: the I/O thread doesn't poll.  It sleeps as soon as it
+		has nothing to do: the guest's doorbell writes (the event
+		indexes of the shadow doorbells ask for them whenever it
+		sleeps) and the completion of the host I/O wake it up, and the
+		host I/O completes with interrupts.  Fewer CPU cycles, more VM
+		exits and a longer latency.  0 (the default): it polls while
+		there is I/O, see poll_timeout_ms.  Only with shadow_doorbell;
+		can only be changed while the device is not open (-EBUSY
+		otherwise).

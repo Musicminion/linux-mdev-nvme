@@ -149,6 +149,7 @@ bool nvme_mdev_hctrl_hq_can_submit(struct nvme_mdev_hctrl *hctrl, u16 qid)
 static void nvme_mdev_hctrl_bio_done(struct bio *bio)
 {
 	struct mbio *mbio = container_of(bio, struct mbio, bio);
+	struct nvme_mdev_vctrl *vctrl;
 	u16 status;
 
 	if (bio->bi_status == BLK_STS_AGAIN)
@@ -156,8 +157,13 @@ static void nvme_mdev_hctrl_bio_done(struct bio *bio)
 	else
 		status = nvme_mdev_translate_error_block(bio->bi_status);
 
-	/* this marks the bio as done for the polling thread */
+	/*
+	 * this marks the bio as done for the polling thread, which may free
+	 * it right away: vctrl first
+	 */
+	vctrl = mbio->vctrl;
 	smp_store_release(&mbio->status, status);
+	nvme_mdev_io_completed(vctrl);
 }
 
 /*
@@ -167,11 +173,13 @@ static void nvme_mdev_hctrl_bio_done(struct bio *bio)
 static void nvme_mdev_hctrl_chain_done(struct bio *bio)
 {
 	struct mbio *mbio = bio->bi_private;
+	struct nvme_mdev_vctrl *vctrl = mbio->vctrl;
 	u16 status = nvme_mdev_translate_error_block(bio->bi_status);
 
 	bio_put(bio);
 	/* publishes the completion, pairs with the acquire in hq_poll() */
 	smp_store_release(&mbio->status, status);
+	nvme_mdev_io_completed(vctrl);
 }
 
 /*
@@ -244,8 +252,9 @@ int nvme_mdev_hctrl_hq_submit(struct nvme_mdev_hctrl *hctrl,
 		 * guest runs out of retries before the reset is over.  Waiting
 		 * here is fine, nothing completes during that time anyway.
 		 */
-		if (bdev_get_queue(vns->host_part)->limits.features &
-		    BLK_FEAT_POLL)
+		if (!nvme_mdev_io_irq_mode(vns->vctrl) &&
+		    (bdev_get_queue(vns->host_part)->limits.features &
+		     BLK_FEAT_POLL))
 			opf |= REQ_POLLED;
 
 		if (WARN_ON(datait->count > BIO_MAX_VECS))
@@ -308,6 +317,7 @@ int nvme_mdev_hctrl_hq_submit(struct nvme_mdev_hctrl *hctrl,
 		mbio->status = NVME_STATUS_PENDING;
 		mbio->flush_after = false;
 		mbio->bdev = vns->host_part;
+		mbio->vctrl = vns->vctrl;
 
 		if (opcode == nvme_cmd_dsm) {
 			chain = nvme_mdev_hctrl_dsm(vns, cmd, datait);
@@ -352,6 +362,7 @@ int nvme_mdev_hctrl_hq_submit(struct nvme_mdev_hctrl *hctrl,
 	mbio->status = NVME_STATUS_PENDING;
 	mbio->flush_after = false;
 	mbio->bdev = vns->host_part;
+	mbio->vctrl = vns->vctrl;
 
 	list_add_tail(&mbio->link, &hwq->bios_in_flight);
 	hwq->inflight++;

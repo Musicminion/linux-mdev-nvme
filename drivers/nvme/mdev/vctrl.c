@@ -78,6 +78,7 @@ int nvme_mdev_vctrl_create(struct nvme_mdev_vctrl *vctrl,
 
 	mutex_init(&vctrl->lock);
 	init_waitqueue_head(&vctrl->io_pause_wq);
+	spin_lock_init(&vctrl->wake_lock);
 	INIT_LIST_HEAD(&vctrl->link);
 	INIT_LIST_HEAD(&vctrl->host_hw_queues);
 	INIT_WORK(&vctrl->ns_gc_work, nvme_mdev_vns_gc_work);
