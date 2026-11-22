@@ -796,7 +796,7 @@ static bool nvme_pci_prp_save_mapping(struct request *req,
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
 
 	if (dma_use_iova(&iod->dma_state) || !dma_need_unmap(dma_dev) ||
-	    (req->cmd_flags & REQ_P2PDMA))
+	    (req->cmd_flags & REQ_P2PDMA) || blk_rq_premapped(req))
 		return true;
 
 	if (!iod->nr_dma_vecs) {
@@ -1036,7 +1036,8 @@ static blk_status_t nvme_pci_setup_data_simple(struct request *req,
 
 	if (!use_sgl && !prp_possible)
 		return BLK_STS_AGAIN;
-	if (is_pci_p2pdma_page(bv.bv_page))
+	/* (pre-mapped pages: through the DMA iterator, see there) */
+	if (is_pci_p2pdma_page(bv.bv_page) || blk_rq_premapped(req))
 		return BLK_STS_AGAIN;
 
 	dma_addr = dma_map_bvec(nvmeq->dev->dev, &bv, rq_dma_dir(req), 0);
@@ -2950,6 +2951,8 @@ static bool nvme_pci_update_nr_queues(struct nvme_dev *dev)
 	if (!dev->ctrl.tagset) {
 		nvme_alloc_io_tag_set(&dev->ctrl, &dev->tagset, &nvme_mq_ops,
 				nvme_pci_nr_maps(dev), sizeof(struct nvme_iod));
+		/* (we map with blk_rq_dma_map_iter_start(): DMA pre-mapping) */
+		dev->tagset.dma_dev = dev->dev;
 		return true;
 	}
 
@@ -3572,6 +3575,8 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (dev->online_queues > 1) {
 		nvme_alloc_io_tag_set(&dev->ctrl, &dev->tagset, &nvme_mq_ops,
 				nvme_pci_nr_maps(dev), sizeof(struct nvme_iod));
+		/* (we map with blk_rq_dma_map_iter_start(): DMA pre-mapping) */
+		dev->tagset.dma_dev = dev->dev;
 		nvme_dbbuf_set(dev);
 	}
 
