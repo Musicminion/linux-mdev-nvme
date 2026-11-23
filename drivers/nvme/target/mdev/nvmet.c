@@ -337,23 +337,43 @@ unsigned int nvme_mdev_nvmet_reap_io(struct nvme_mdev_vctrl *vctrl)
  * I/O thread: poll for the completion of the I/O commands in flight that
  * nvmet submitted as polled bios (NVMF_POLLED_IO), which completes them
  * (->queue_response).  One poll reaps everything done on the host queue it
- * looks at; our bios go to the poll queue of the CPU we run on, so the
- * newest command covers almost all of them, the oldest the ones submitted
- * before the thread moved to another CPU.
+ * looks at: one command per host queue.  (Our bios go to the poll queue of
+ * the CPU we run on, so there are few: more after the thread moved between
+ * CPUs.  A namespace's bdev is a partition, or another disk: the request
+ * queue tells them apart.)
  */
 void nvme_mdev_nvmet_poll_io(struct nvme_mdev_vctrl *vctrl)
 {
-	struct nvme_mdev_iod *first, *last;
+	struct {
+		struct request_queue *q;
+		blk_qc_t cookie;
+	} polled[8];
+	unsigned int n = 0, i;
+	struct nvme_mdev_iod *iod;
+	struct request_queue *q;
+	blk_qc_t cookie;
 
-	if (list_empty(&vctrl->io_list))
-		return;
-
-	last = list_last_entry(&vctrl->io_list, struct nvme_mdev_iod, link);
-	nvmet_req_poll(&last->req, BLK_POLL_ONESHOT);
-
-	first = list_first_entry(&vctrl->io_list, struct nvme_mdev_iod, link);
-	if (first != last)
-		nvmet_req_poll(&first->req, BLK_POLL_ONESHOT);
+	/*
+	 * Every hardware queue with a polled bio of ours in flight, once:
+	 * nobody else reaps those completions (but the host's timeout
+	 * handler, after 30s).  The list is ours, completions only add to
+	 * io_done.
+	 */
+	list_for_each_entry(iod, &vctrl->io_list, link) {
+		if (!nvmet_req_poll_queue(&iod->req, &q, &cookie))
+			continue;
+		for (i = 0; i < n; i++)
+			if (polled[i].q == q && polled[i].cookie == cookie)
+				break;
+		if (i < n)
+			continue;
+		if (n < ARRAY_SIZE(polled)) {
+			polled[n].q = q;
+			polled[n].cookie = cookie;
+			n++;
+		}
+		nvmet_req_poll(&iod->req, BLK_POLL_ONESHOT);
+	}
 }
 
 /* ------------------------------------------------------------------ */
