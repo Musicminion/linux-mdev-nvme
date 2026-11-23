@@ -233,6 +233,7 @@ static void nvme_mdev_hctrl_work(struct work_struct *w)
 	struct nvme_mdev_vctrl *vctrl = mbio->vctrl;
 	struct bio *bio = &mbio->bio;
 	struct bio *chain = NULL;
+	struct blk_dma_premap *pm;
 	blk_opf_t opf;
 	u16 status;
 	int ret;
@@ -241,10 +242,14 @@ static void nvme_mdev_hctrl_work(struct work_struct *w)
 	case MBIO_WORK_RESUBMIT:
 		/* (the bio's sector may be remapped: from the saved iter) */
 		opf = bio->bi_opf & ~(REQ_POLLED | REQ_NOWAIT);
+		pm = bio->bi_premap;
 		bio_reset(bio, mbio->bdev, opf);
 		bio->bi_vcnt = mbio->vcnt;
 		bio->bi_iter = mbio->iter;
 		bio->bi_end_io = nvme_mdev_hctrl_bio_done;
+		/* (bio_reset() forgets it; the pages are still in it) */
+		if (pm)
+			bio_set_premap(bio, pm);
 		break;
 	case MBIO_WORK_FLUSH:
 		bio_reset(bio, mbio->bdev, REQ_OP_WRITE | REQ_PREFLUSH);
