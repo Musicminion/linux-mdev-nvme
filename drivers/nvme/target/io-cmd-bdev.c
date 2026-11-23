@@ -177,14 +177,53 @@ u16 blk_to_nvme_status(struct nvmet_req *req, blk_status_t blk_sts)
 	return status;
 }
 
+static void nvmet_bdev_execute_rw(struct nvmet_req *req);
+
+static void nvmet_bdev_async_work(struct work_struct *w)
+{
+	struct nvmet_req *req = container_of(w, struct nvmet_req, b.work);
+
+	req->b.execute(req);
+}
+
+/* NVMF_POLLED_IO: flush, DSM, Write Zeroes from a work item */
+static void nvmet_bdev_execute_async(struct nvmet_req *req)
+{
+	INIT_WORK(&req->b.work, nvmet_bdev_async_work);
+	queue_work(nvmet_wq, &req->b.work);
+}
+
+/* a polled read or write that would have waited: the ordinary way */
+static void nvmet_bdev_rw_work(struct work_struct *w)
+{
+	struct nvmet_req *req = container_of(w, struct nvmet_req, b.work);
+
+	req->b.no_poll = true;
+	nvmet_bdev_execute_rw(req);
+}
+
 static void nvmet_bio_done(struct bio *bio)
 {
 	struct nvmet_req *req = bio->bi_private;
 	blk_status_t blk_status = bio->bi_status;
+	bool nowait = bio->bi_opf & REQ_NOWAIT;
 
 	/* before the bio can be freed, see nvmet_req_poll() */
 	WRITE_ONCE(req->poll_bio, NULL);
 	nvmet_req_bio_put(req, bio);
+
+	/*
+	 * A polled bio had to wait (the queue is frozen, no tag is free, the
+	 * bio has to be split): the transport's thread that submitted it must
+	 * not, as it is the one that polls for the completions that end the
+	 * wait (a controller reset waits for them before it unfreezes the
+	 * queue).  Submit it again from a work item, without polling.
+	 */
+	if (blk_status == BLK_STS_AGAIN && nowait) {
+		INIT_WORK(&req->b.work, nvmet_bdev_rw_work);
+		queue_work(nvmet_wq, &req->b.work);
+		return;
+	}
 	nvmet_req_complete(req, blk_to_nvme_status(req, blk_status));
 }
 
@@ -248,14 +287,35 @@ static int nvmet_bdev_alloc_bip(struct nvmet_req *req, struct bio *bio,
  * clears REQ_POLLED if it has to split it, and it then completes from
  * interrupt context as usual).
  */
+/*
+ * The transport polls (NVMF_POLLED_IO) and the device can poll: its queue
+ * may have polled bios of the transport's thread in flight, which only that
+ * thread reaps.  It must not sleep in submit_bio() for this queue then (see
+ * nvmet_bio_done()).  (REQ_NOWAIT too.)
+ */
+static bool nvmet_bdev_polled_queue(struct nvmet_req *req)
+{
+	return (req->ops->flags & NVMF_POLLED_IO) &&
+	       (bdev_get_queue(req->ns->bdev)->limits.features & BLK_FEAT_POLL) &&
+	       bdev_nowait(req->ns->bdev);
+}
+
 static bool nvmet_bdev_use_polled_io(struct nvmet_req *req)
 {
-	if (!(req->ops->flags & NVMF_POLLED_IO) || req->metadata_len)
+	struct request_queue *q = bdev_get_queue(req->ns->bdev);
+
+	if (!nvmet_bdev_polled_queue(req) || req->metadata_len ||
+	    req->b.no_poll)
 		return false;
-	if (!(bdev_get_queue(req->ns->bdev)->limits.features & BLK_FEAT_POLL))
-		return false;
+	/*
+	 * One bio, which the block layer needn't split (it would fail it, as
+	 * REQ_NOWAIT, and we would submit it again from the work item).
+	 * E.g. with an IOMMU, NVMe takes 128K at most (dma_opt_mapping_size).
+	 */
 	return req->sg_cnt <= (nvmet_use_inline_bvec(req) ?
-			       NVMET_MAX_INLINE_BIOVEC : BIO_MAX_VECS);
+			       NVMET_MAX_INLINE_BIOVEC : BIO_MAX_VECS) &&
+	       req->sg_cnt <= queue_max_segments(q) &&
+	       nvmet_rw_data_len(req) <= queue_max_hw_sectors(q) << SECTOR_SHIFT;
 }
 
 /**
@@ -283,6 +343,35 @@ int nvmet_req_poll(struct nvmet_req *req, unsigned int flags)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(nvmet_req_poll);
+
+/**
+ * nvmet_req_poll_queue - the hardware queue nvmet_req_poll() polls
+ * @req: the request
+ * @q: its request queue
+ * @cookie: the hardware queue in @q
+ *
+ * Returns false if @req has no polled bio in flight.  Polling one request
+ * reaps the completions of all requests on the same hardware queue: a
+ * transport with many requests in flight needs to poll only one request of
+ * each @q and @cookie.  Same rules as for nvmet_req_poll().
+ */
+bool nvmet_req_poll_queue(struct nvmet_req *req, struct request_queue **q,
+		blk_qc_t *cookie)
+{
+	struct bio *bio;
+	bool ret = false;
+
+	rcu_read_lock();
+	bio = READ_ONCE(req->poll_bio);
+	if (bio) {
+		*q = bdev_get_queue(bio->bi_bdev);
+		*cookie = READ_ONCE(bio->bi_cookie);
+		ret = true;
+	}
+	rcu_read_unlock();
+	return ret;
+}
+EXPORT_SYMBOL_GPL(nvmet_req_poll_queue);
 
 static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 {
@@ -321,8 +410,14 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 	if (is_pci_p2pdma_page(sg_page(req->sg)))
 		opf |= REQ_NOMERGE;
 
-	if (nvmet_bdev_use_polled_io(req))
-		opf |= REQ_POLLED;
+	if (nvmet_bdev_use_polled_io(req)) {
+		opf |= REQ_POLLED | REQ_NOWAIT;
+	} else if (nvmet_bdev_polled_queue(req) && !req->b.no_poll) {
+		/* not polled, but on a queue we poll: from the work item */
+		INIT_WORK(&req->b.work, nvmet_bdev_rw_work);
+		queue_work(nvmet_wq, &req->b.work);
+		return;
+	}
 
 	sector = nvmet_lba_to_sect(req->ns, req->cmd->rw.slba);
 
@@ -512,19 +607,31 @@ u16 nvmet_bdev_parse_io_cmd(struct nvmet_req *req)
 	case nvme_cmd_read:
 	case nvme_cmd_write:
 		req->execute = nvmet_bdev_execute_rw;
+		req->b.no_poll = false;
 		if (req->sq->ctrl->pi_support && nvmet_ns_has_pi(req->ns))
 			req->metadata_len = nvmet_rw_metadata_len(req);
 		return 0;
 	case nvme_cmd_flush:
 		req->execute = nvmet_bdev_execute_flush;
-		return 0;
+		break;
 	case nvme_cmd_dsm:
 		req->execute = nvmet_bdev_execute_dsm;
-		return 0;
+		break;
 	case nvme_cmd_write_zeroes:
 		req->execute = nvmet_bdev_execute_write_zeroes;
-		return 0;
+		break;
 	default:
 		return nvmet_report_invalid_opcode(req);
 	}
+
+	/*
+	 * A polling transport's thread must not sleep in the block layer (see
+	 * nvmet_bio_done()): these can, in submit_bio() while the queue is
+	 * frozen, and the discard and zeroing helpers submit as they go.
+	 */
+	if (nvmet_bdev_polled_queue(req)) {
+		req->b.execute = req->execute;
+		req->execute = nvmet_bdev_execute_async;
+	}
+	return 0;
 }

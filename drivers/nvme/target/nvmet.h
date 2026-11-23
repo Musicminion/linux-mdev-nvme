@@ -471,6 +471,13 @@ struct nvmet_req {
 	union {
 		struct {
 			struct bio      inline_bio;
+			/*
+			 * NVMF_POLLED_IO: what the transport's thread must
+			 * not do, see nvmet_bio_done()
+			 */
+			struct work_struct	work;
+			void			(*execute)(struct nvmet_req *req);
+			bool			no_poll;
 		} b;
 		struct {
 			bool			mpool_alloc;
@@ -584,6 +591,8 @@ bool nvmet_req_init(struct nvmet_req *req, struct nvmet_sq *sq,
 		const struct nvmet_fabrics_ops *ops);
 void nvmet_req_uninit(struct nvmet_req *req);
 int nvmet_req_poll(struct nvmet_req *req, unsigned int flags);
+bool nvmet_req_poll_queue(struct nvmet_req *req, struct request_queue **q,
+		blk_qc_t *cookie);
 size_t nvmet_req_transfer_len(struct nvmet_req *req);
 bool nvmet_check_transfer_len(struct nvmet_req *req, size_t len);
 bool nvmet_check_data_len_lte(struct nvmet_req *req, size_t data_len);
