@@ -380,6 +380,14 @@ struct nvme_mdev_inst_type {
 #define NVME_STATUS_PENDING 0xFFFF
 #define MDEV_NVME_NUM_BIO_QUEUES NVME_MDEV_MAX_INSTANCES
 
+/* what the work item does for an mbio, see nvme_mdev_hctrl_work() */
+enum {
+	MBIO_WORK_SUBMIT,	/* submit the bio (a flush) */
+	MBIO_WORK_RESUBMIT,	/* a polled read/write that had to wait */
+	MBIO_WORK_CHAIN,	/* DSM, Write Zeroes: build and submit */
+	MBIO_WORK_FLUSH,	/* the flush after a Write Zeroes with FUA */
+};
+
 struct mbio {
 	/* link in a list of pending bios*/
 	struct list_head link;
@@ -396,6 +404,25 @@ struct mbio {
 
 	/* the controller it is for (interrupt mode wake-ups) */
 	struct nvme_mdev_vctrl *vctrl;
+
+	/* submitted as a polled bio: our thread polls it */
+	bool polled;
+
+	/*
+	 * What may sleep in the block layer is done by a work item (see
+	 * nvme_mdev_hctrl_work()), with what it needs: the data of a read
+	 * or write to submit again, the ranges of a DSM, the range of a
+	 * Write Zeroes
+	 */
+	struct work_struct work;
+	u8 work_op;
+	struct bvec_iter iter;
+	unsigned short vcnt;
+	struct nvme_dsm_range *ranges;
+	unsigned int nr_ranges;
+	unsigned int shift;
+	sector_t sector, nr_sects;
+	unsigned int zero_flags;
 
 	/* must be last for bioset allocation*/
 	struct bio bio;
