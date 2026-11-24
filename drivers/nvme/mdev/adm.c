@@ -635,8 +635,8 @@ static int nvme_mdev_adm_handle_get_features(struct adm_ctx *ctx)
 	switch (fid) {
 	/* Number of queues */
 	case NVME_FEAT_NUM_QUEUES:
-		value = (MAX_VIRTUAL_QUEUES - 1) |
-			((MAX_VIRTUAL_QUEUES - 1) << 16);
+		value = (MAX_VIRTUAL_QUEUES - 2) |
+			((MAX_VIRTUAL_QUEUES - 2) << 16);
 		goto out;
 
 	/* Arbitration */
@@ -723,8 +723,8 @@ static int nvme_mdev_adm_handle_set_features(struct adm_ctx *ctx)
 	switch (fid) {
 	case NVME_FEAT_NUM_QUEUES:
 		/* need to return the value here as well */
-		value = (MAX_VIRTUAL_QUEUES - 1) |
-			((MAX_VIRTUAL_QUEUES - 1) << 16);
+		value = (MAX_VIRTUAL_QUEUES - 2) |
+			((MAX_VIRTUAL_QUEUES - 2) << 16);
 
 		nvme_mdev_vsq_cmd_done_adm(ctx->vctrl, value,
 					   cid, NVME_SC_SUCCESS);
